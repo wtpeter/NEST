@@ -165,17 +165,10 @@ def get_ao_soc_1e(mol, zeff_type='one'):
     return np.array([ao_soc_m1, ao_soc_0, ao_soc_1])
 
 def get_ao_soc_x2camf(mol):
-    import resource
-    try:
-        soft, hard = resource.getrlimit(resource.RLIMIT_STACK)
-        target = resource.RLIM_INFINITY if hard == resource.RLIM_INFINITY else hard
-        resource.setrlimit(resource.RLIMIT_STACK, (target, hard))
-    except Exception as e:
-        print(f"Warning: failed to increase stack size: {e}")
     try:
         from socutils.somf import somf_pt
     except ImportError:
-        raise ImportError("Please install socutils package to use X2CAMF SOC integrals." \
+        raise ImportError("Please install socutils package to use X2CAMF SOC integrals. " \
         "https://github.com/wtpeter/socutils")
     ao_soc = 2j * somf_pt.get_psoc_x2camf(mol, xresp=X2CAMF_XRESP)
     ao_soc_1 = -0.5 * (ao_soc[0] + 1j * ao_soc[1])
@@ -191,54 +184,30 @@ def get_ao_soc_2e_somf(mf):
     mol = mf.mol
     dm = mf.make_rdm1()
 
-    if dm.ndim == 2:
-        dmaa = dmbb = 0.5 * dm
-    else:
-        dmaa, dmbb = dm
+    if dm.ndim == 3:
+        dm = dm[0] + dm[1]
 
-    dm_list = [dmaa, dmaa, dmaa, dmbb, dmbb, dmbb]
-    scripts = [
-        'ijkl,lk->ij', # J for dmaa
-        'ijkl,jk->il', # K1 for dmaa
-        'ijkl,li->kj', # K2 for dmaa
-        'ijkl,lk->ij', # J for dmbb
-        'ijkl,jk->il', # K1 for dmbb
-        'ijkl,li->kj'  # K2 for dmbb
-    ]
+    dm_list = [dm, dm, dm]
+    scripts = ['ijkl,lk->ij', 'ijkl,jk->il', 'ijkl,li->kj']
     v_matrices = get_jk(mol, dm_list, scripts=scripts, intor='int2e_p1vxp1', comp=3, aosym='a4ij')
-    vj_aa, vk1_aa, vk2_aa = v_matrices[0:3]
-    vj_bb, vk1_bb, vk2_bb = v_matrices[3:6]
+    vj, vk1, vk2 = v_matrices[0:3]
 
-    v_cart_1 = (vj_aa - vk1_aa - 2 * vk2_aa) + (vj_bb - 2 * vk1_bb - vk2_bb)
-    v_cart_0 = (vj_aa + vj_bb) - 1.5 * (vk1_aa + vk1_bb) - 1.5 * (vk2_aa + vk2_bb)
-    v_cart_m1 = (vj_aa - 2 * vk1_aa - vk2_aa) + (vj_bb - vk1_bb - 2 * vk2_bb)
-
-    def to_spherical(v_cart_xyz, component):
-        # v_cart_xyz shape is (3, nao, nao)
-        vx = v_cart_xyz[0]
-        vy = v_cart_xyz[1]
-        vz = v_cart_xyz[2]
-        if component == 1:
-            return -0.5 * (vx + 1j * vy)
-        elif component == 0:
-            return np.sqrt(0.5) * vz
-        elif component == -1:
-            return 0.5 * (vx - 1j * vy)
+    vx, vy, vz = vj - 1.5 * (vk1 + vk2)
 
     prefactor = 1j / (2.0 * LIGHT_SPEED**2)
-    soc_somf_1 = to_spherical(v_cart_1, 1) * prefactor
-    soc_somf_0 = to_spherical(v_cart_0, 0) * prefactor
-    soc_somf_m1 = to_spherical(v_cart_m1, -1) * prefactor
-    soc_somf_1, soc_somf_m1 = (
-        0.5 * (soc_somf_1 + soc_somf_m1.conj()),
-        0.5 * (soc_somf_m1 + soc_somf_1.conj()),
-    )
+    soc_somf_1 = -0.5 * prefactor * (vx + 1j * vy)
+    soc_somf_0 = np.sqrt(0.5) * prefactor * vz
+    soc_somf_m1 = 0.5 * prefactor * (vx - 1j * vy)
     return np.array([soc_somf_m1, soc_somf_0, soc_somf_1])
 
 
 def _symmetrize_ao_soc(soc_ao):
     """Enforce the Hermiticity relations of a rank-one spherical tensor."""
     soc_m1, soc_0, soc_1 = soc_ao
+    soc_1, soc_m1 = (
+        0.5 * (soc_1 + soc_m1.conj()),
+        0.5 * (soc_m1 + soc_1.conj()),
+    )
     soc_0 = 0.5 * (soc_0 + soc_0.conj().T)
     soc_m1, soc_1 = (
         0.5 * (soc_m1 - soc_1.conj().T),
