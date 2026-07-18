@@ -849,6 +849,10 @@ class NTTDA(TDBase):
     gen_vind_sc = gen_vind_sc
     gen_vind_sfd = gen_vind_sfd
 
+    def SOC(self, *others, soctype="SOMF", include_reference=False):
+        from nest.soc import nttda as nttda_soc
+        return nttda_soc.SOC(self, *others, soctype=soctype, include_reference=include_reference)
+
 
 def _guess_wfnsym_id(tdobj, x_sym, x):
     possible_sym = np.asarray(x_sym)[np.abs(np.asarray(x)) > 1e-7]
