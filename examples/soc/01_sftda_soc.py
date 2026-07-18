@@ -31,10 +31,22 @@ mol = gto.M(
     symmetry=False,
 )
 
-# 1. High-spin scalar reference.
+# 1. High-spin scalar reference.  Both ROKS and UKS references are supported:
+#
+#     mf = mol.ROKS(xc="SVWN").run()
+#     mf = mol.UKS(xc="SVWN").run()
+#
+# This example uses UKS.
 mf = mol.UKS(xc="SVWN").run()
 
-# 2. Spin-flip-down TDA states. SOC currently supports extype=1 only.
+# 2. Spin-flip-down excited states.  Both SF-TDA and SF-TDDFT are supported:
+#
+#     td = mf.SFTDA()
+#     td = mf.SFTDDFT()
+#
+# The XC response can use either collinear="col" or multicollinear="mcol".
+# This example uses multicollinear SF-TDA.
+# SOC currently supports extype=1 only.
 td = mf.SFTDA().set(
     extype=1,
     nstates=3,
@@ -49,11 +61,22 @@ td = mf.SFTDA().set(
 # attributes.
 soc_driver = td.SOC(soctype="SOMF").run()
 #
-# The equivalent explicit construction is:
+# Equivalent explicit construction:
 #
-#     from nest import soc
-#     soc_driver = soc.sftda.SOC(td, soctype="SOMF")
+#     from nest.soc import SFTDASOC
+#     soc_driver = SFTDASOC(td, soctype="SOMF").run()
+#
+# Empty construction is also supported.  The TD object and all options are read
+# when run()/kernel() starts, so attributes can be changed before calculation:
+#
+#     soc_driver = SFTDASOC()
+#     soc_driver.tdobj = td
+#     soc_driver.soctype = "SOMF"
 #     e, v = soc_driver.kernel()
+#
+# The same setup can be written with the StreamObject interface:
+#
+#     soc_driver = SFTDASOC().run(tdobj=td, soctype="SOMF")
 #
 # The first argument is the converged SF-TDA/SF-TDDFT object ``td``, not the
 # SCF object ``mf``.  Available soctype values are:
