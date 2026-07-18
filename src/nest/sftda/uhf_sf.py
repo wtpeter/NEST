@@ -516,6 +516,12 @@ class TDA_SF(TDBase):
     _keys = {'extype', 'collinear', 'collinear_samples'}
 
     def __init__(self, mf, extype=1, collinear="mcol", collinear_samples=20):
+        mf = mf.remove_soscf()
+        if isinstance(mf, scf.rohf.ROHF) or isinstance(mf, scf.hf_symm.SymAdaptedROHF):
+            if isinstance(mf, dft.roks.ROKS) or isinstance(mf, dft.rks_symm.SymAdaptedROKS):
+                mf = mf.to_uks()
+            else:
+                mf = mf.to_uhf()
         TDBase.__init__(self,mf)
         # extype is used to determine which spin flip excitation will be calculated.
         # spin flip up: exytpe=0, spin flip down: exytpe=1.
@@ -958,3 +964,11 @@ dft.uks.UKS.SFTDA = lib.class_as_method(TDA_SF)
 dft.uks.UKS.SFTDDFT = lib.class_as_method(TDDFT_SF)
 scf.uhf.UHF.SFTDA = lib.class_as_method(TDA_SF)
 scf.uhf.UHF.SFTDDFT = lib.class_as_method(TDDFT_SF)
+dft.roks.ROKS.TDA_SF = lib.class_as_method(TDA_SF)
+dft.roks.ROKS.TDDFT_SF = lib.class_as_method(TDDFT_SF)
+dft.roks.ROKS.SFTDA = lib.class_as_method(TDA_SF)
+dft.roks.ROKS.SFTDDFT = lib.class_as_method(TDDFT_SF)
+dft.rks_symm.SymAdaptedROKS.TDA_SF = lib.class_as_method(TDA_SF)
+dft.rks_symm.SymAdaptedROKS.TDDFT_SF = lib.class_as_method(TDDFT_SF)
+dft.rks_symm.SymAdaptedROKS.SFTDA = lib.class_as_method(TDA_SF)
+dft.rks_symm.SymAdaptedROKS.SFTDDFT = lib.class_as_method(TDDFT_SF)
