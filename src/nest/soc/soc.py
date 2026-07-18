@@ -81,18 +81,22 @@ class SOCBase(lib.StreamObject):
 
     _keys = {'states', 'soctype', 'soc_ao', 'state_slices', 'h_soc', 'e', 'v'}
 
-    def __init__(self, mf, states, soctype='SOMF'):
-        self._scf = mf
-        self.states = list(states)
+    def __init__(self, soctype='SOMF'):
+        self._scf = None
+        self.states = []
         self.soctype = soctype
-        self.verbose = getattr(mf, 'verbose', logger.NOTE)
-        self.stdout = getattr(mf, 'stdout', None)
+        self.verbose = None
+        self.stdout = None
 
         self.soc_ao = None
         self.state_slices = None
         self.h_soc = None
         self.e = None
         self.v = None
+
+    def _initialize_states(self):
+        """Build method-specific scalar states from the current options."""
+        raise NotImplementedError
 
     @staticmethod
     def _m_values(spin):
@@ -134,6 +138,11 @@ class SOCBase(lib.StreamObject):
         return block
 
     def build_hamiltonian(self):
+        self.states = list(self._initialize_states())
+        self.state_slices = None
+        self.h_soc = None
+        self.e = None
+        self.v = None
         self.soc_ao = get_ao_soc(self._scf, self.soctype)
         self.state_slices = []
         start = 0
