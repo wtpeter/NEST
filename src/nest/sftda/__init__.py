@@ -14,32 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from pyscf import scf, dft
 from nest.sftda import uhf_sf
-
-
-def TDA_SF(mf):
-    mf = mf.remove_soscf()
-    if isinstance(mf, scf.rohf.ROHF) or isinstance(mf, scf.hf_symm.SymAdaptedROHF):
-        if isinstance(mf, dft.roks.ROKS) or isinstance(mf, dft.rks_symm.SymAdaptedROKS):
-            mf = mf.to_uks()
-        else:
-            mf = mf.to_uhf()
-    return mf.TDA_SF()
-
-
-def TDDFT_SF(mf):
-    mf = mf.remove_soscf()
-    if isinstance(mf, scf.rohf.ROHF) or isinstance(mf, scf.hf_symm.SymAdaptedROHF):
-        if isinstance(mf, dft.roks.ROKS) or isinstance(mf, dft.rks_symm.SymAdaptedROKS):
-            mf = mf.to_uks()
-        else:
-            mf = mf.to_uhf()
-    return mf.TDDFT_SF()
-
-
-SFTDA = TDA_SF
-SFTDDFT = TDDFT_SF
+from nest.sftda.uhf_sf import SFTDA, SFTDDFT, TDA_SF, TDDFT_SF
 
 __all__ = [
     "SFTDA",
