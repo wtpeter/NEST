@@ -131,21 +131,21 @@ If you use NEST in your research, please cite the relevant publication(s) listed
 
 ### Noncollinear DFT
 
-- Multicollinear approach (PRR, 2023)
-- Matrix representation (WIREs, 2026)
-- Nonlocal functionals (JCP, 2025)
+- Multicollinear approach (PRR, 2023) https://doi.org/10.1103/PhysRevResearch.5.013036
+- Matrix representation (WIREs, 2026) https://doi.org/10.1002/wcms.70063
+- Nonlocal functionals (JCP, 2025) https://doi.org/10.1063/5.0260762
 
 ### Noncollinear TDDFT
 
-- Noncollinear TDDFT and noncollinear SF-TDDFT (JCTC, 2023)
-- Real-time noncollinear TDDFT (JCTC, 2024)
+- Noncollinear TDDFT and noncollinear SF-TDDFT (JCTC, 2023) https://doi.org/10.1021/acs.jctc.3c00059
+- Real-time noncollinear TDDFT (JCTC, 2024) https://doi.org/10.1021/acs.jctc.4c01218
 
 ### Noncollinear SF-TDDFT
 
-- Analytic gradients (JCTC, 2025)
-- Zero-excitation-energy theorem (JCTC, 2025)
-- Conical intersections and spin crossings (JCTC, 2025)
-- Analytic nonadiabatic derivative couplings (JCTC, 2026)
+- Analytic gradients (JCTC, 2025) https://doi.org/10.1021/acs.jctc.5c00115
+- Zero-excitation-energy theorem (JCTC, 2025) https://doi.org/10.1021/acs.jctc.5c00714
+- Conical intersections and spin crossings (JCTC, 2025) https://doi.org/10.1021/acs.jctc.5c01272
+- Analytic nonadiabatic derivative couplings (JCTC, 2026) https://doi.org/10.1021/acs.jctc.6c00556
 
 ### Noncollinear Tensor TDA (NT-TDA)
 
