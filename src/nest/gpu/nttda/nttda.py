@@ -763,7 +763,9 @@ class NTTDA(TDA):
         super().__init__(mf)
 
     def nuc_grad_method(self):
-        raise NotImplementedError('GPU NTTDA gradients are not implemented')
+        from nest.gpu.grad.nttda import Gradients
+
+        return Gradients(self)
 
     Gradients = nuc_grad_method
 
