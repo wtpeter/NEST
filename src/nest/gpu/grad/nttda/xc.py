@@ -9,8 +9,10 @@ from dataclasses import dataclass
 import cupy as cp
 
 from gpu4pyscf.dft import numint
+from gpu4pyscf.grad import rks as rks_grad
 from gpu4pyscf.grad import tdrks as tdrks_grad
-from gpu4pyscf.lib.cupy_helper import contract
+from gpu4pyscf.gto.mole import ATOM_OF
+from gpu4pyscf.lib.cupy_helper import add_sparse, contract, take_last2d
 
 
 
@@ -203,6 +205,61 @@ def contract_pair_feature_derivatives(
             delta[right], grid_weights, optimize=True,
         )
     return value
+
+
+def _contract_gga_pair_ao_rows(
+        output, ao, densities, contracted_ao, tensor_weights, grid_weights,
+        transpose_buf, coefficient_buf):
+    """Accumulate directed-pair AO-center derivatives by AO row."""
+    derivative_indices = (
+        (1, 2, 3),
+        (4, 5, 6),
+        (5, 7, 8),
+        (6, 8, 9),
+    )
+    coefficient_buf[...] = cp.einsum(
+        "pabg,pagi->bgi", tensor_weights, contracted_ao,
+    )
+    for feature, indices in enumerate(derivative_indices):
+        output -= cp.einsum(
+            "gi,xgi,g->ix",
+            coefficient_buf[feature], ao[list(indices)], grid_weights,
+        )
+
+    coefficient_buf.fill(0.0)
+    densities_t = densities.swapaxes(-1, -2)
+    for right in range(4):
+        transpose_buf[...] = ao[right] @ densities_t
+        coefficient_buf += cp.einsum(
+            "pag,pgi->agi",
+            tensor_weights[:, :, right], transpose_buf,
+        )
+    for feature, indices in enumerate(derivative_indices):
+        output -= cp.einsum(
+            "gi,xgi,g->ix",
+            coefficient_buf[feature], ao[list(indices)], grid_weights,
+        )
+
+
+def _reduce_sorted_ao_to_atoms(sorted_mol, ao_values, atmlst=None):
+    """Reduce sorted-AO row values to their owning atoms."""
+    atom_of_basis = cp.asarray(sorted_mol._bas[:, ATOM_OF])
+    ao_loc = cp.asarray(sorted_mol.ao_loc_nr())
+    basis_of_ao = cp.searchsorted(
+        ao_loc[1:], cp.arange(sorted_mol.nao), side="right",
+    )
+    atom_of_ao = atom_of_basis[basis_of_ao]
+    single = ao_values.ndim == 2
+    if single:
+        ao_values = ao_values[None]
+    atom_values = cp.zeros((
+        len(ao_values), sorted_mol.natm, ao_values.shape[-1],
+    ))
+    for index, values in enumerate(ao_values):
+        cp.add.at(atom_values[index], atom_of_ao, values)
+    if atmlst is not None:
+        atom_values = atom_values[:, cp.asarray(atmlst, dtype=cp.int32)]
+    return atom_values[0] if single else atom_values
 
 
 def gga_pair_potential(kernel, features):
@@ -566,6 +623,86 @@ def _contract_vxc_derivative(
         cp.stack((density_alpha, density_beta)),
         probe_densities,
     ))
+    if xctype in ("GGA", "MGGA"):
+        opt = ni.gdftopt
+        if opt is None:
+            ni.build(mol, mf.grids.coords)
+            opt = ni.gdftopt
+        sorted_mol = opt._sorted_mol
+        density_stack = opt.sort_orbitals(
+            density_stack, axis=[1, 2],
+        )
+        nao = sorted_mol.nao
+        ao_output = cp.zeros((len(probe_alpha), nao, 3))
+        gradient_buf = cp.empty(3 * nao * numint.MIN_BLK_SIZE)
+        matrix_buf = cp.empty(3 * nao * nao)
+        density_buf = cp.empty(nao * nao)
+
+        for ao, mask, weights, _coords in ni.block_loop(
+                sorted_mol, mf.grids, nao, 2, max_memory=None):
+            rho = []
+            for density in density_stack:
+                density_mask = take_last2d(
+                    density, mask, out=density_buf,
+                )
+                rho.append(ni.eval_rho(
+                    sorted_mol, ao, density_mask, None, xctype,
+                    hermi=1, with_lapl=False,
+                ))
+            rho = cp.asarray(rho)
+            reference_rho = rho[:2]
+            probe_rho = rho[2:].reshape(
+                len(probe_alpha), 2, *rho.shape[1:],
+            )
+            vxc, fxc = ni.eval_xc_eff(
+                mf.xc, reference_rho, deriv=2,
+                xctype=xctype, spin=1,
+            )[1:3]
+            reference_weights = cp.einsum(
+                "axbyg,nbyg->naxg", fxc, probe_rho,
+            )
+
+            for probe in range(len(probe_alpha)):
+                for spin in range(2):
+                    terms = (
+                        (
+                            density_stack[spin],
+                            reference_weights[probe, spin],
+                        ),
+                        (
+                            density_stack[2 + 2 * probe + spin],
+                            vxc[spin],
+                        ),
+                    )
+                    for density, feature_weights in terms:
+                        feature_weights = cp.ascontiguousarray(
+                            feature_weights * weights,
+                        )
+                        feature_weights[0] *= 0.5
+                        if xctype == "MGGA":
+                            feature_weights[4] *= 0.5
+                        derivative = rks_grad._gga_grad_sum_(
+                            ao, feature_weights[:4],
+                            buf=gradient_buf, out=matrix_buf,
+                        )
+                        if xctype == "MGGA":
+                            derivative = rks_grad._tau_grad_dot_(
+                                ao, feature_weights[4],
+                                accumulate=True, buf=gradient_buf,
+                                out=derivative,
+                            )
+                        density_mask = take_last2d(
+                            density, mask, out=density_buf,
+                        )
+                        ao_output[probe, mask] -= 2.0 * cp.einsum(
+                            "xij,ij->ix", derivative, density_mask,
+                        )
+
+        atom_output = _reduce_sorted_ao_to_atoms(
+            sorted_mol, ao_output, atmlst,
+        )
+        return atom_output[0] if single_probe else atom_output
+
     offsets = mol.offset_nr_by_atom()
     ao_deriv = 1 if xctype == "LDA" else 2
     for ao, mask, weights, _coords in _block_loop(ni,
@@ -949,6 +1086,16 @@ def gga_response_terms(
         densities, density_alpha, density_beta,
     )
     offsets = mol.offset_nr_by_atom()
+    if with_direct:
+        ao_direct = cp.zeros((nao, 3))
+        gradient_buf = cp.empty(3 * nao * numint.MIN_BLK_SIZE)
+        matrix_buf = cp.empty(3 * nao * nao)
+        transpose_buf = cp.empty((
+            len(pair_labels), numint.MIN_BLK_SIZE, nao,
+        ))
+        coefficient_buf = cp.empty((
+            4, numint.MIN_BLK_SIZE, nao,
+        ))
     for ao, mask, weights, _coords in _block_loop(ni,
             mol, mf.grids, nao, 2, max_memory=gradient_driver.max_memory):
         rho0 = _eval_rho2(ni,
@@ -1016,13 +1163,6 @@ def gga_response_terms(
                 reference_weights_beta += cp.einsum(
                     "xyg,xyzg->zg", pair, kref_beta,
                 )
-        ordinary_weight_stack = cp.asarray([
-            ordinary_weights[label] for label in density_labels
-        ])
-        special_weight_stack = cp.asarray([
-            special_weights[label] for label in pair_labels
-        ])
-
         for label in potentials:
             add_gga_matrix(
                 potentials[label],
@@ -1042,37 +1182,42 @@ def gga_response_terms(
 
         if not with_direct:
             continue
-        for k, atom in enumerate(atmlst):
-            p0, p1 = offsets[atom][2:]
-            for xyz in range(3):
-                drho, drho_alpha, drho_beta, ao_delta = (
-                    _response_density_derivatives(
-                        ao, density_stack, density_labels,
-                        p0, p1, xyz, "GGA",
-                    )
-                )
-                drho_stack = cp.asarray([
-                    drho[label] for label in density_labels
-                ])
-                value = cp.einsum(
-                    "nfg,nfg,g->",
-                    ordinary_weight_stack, drho_stack, weights,
-                )
-                value += cp.einsum(
-                    "fg,fg,g->",
-                    reference_weights_alpha, drho_alpha, weights,
-                )
-                value += cp.einsum(
-                    "fg,fg,g->",
-                    reference_weights_beta, drho_beta, weights,
-                )
-                if pair_labels:
-                    value += contract_pair_feature_derivatives(
-                        ao, pair_density_stack, ao_delta,
-                        contracted_pair_ao, p0, p1,
-                        special_weight_stack, weights,
-                    )
-                direct[k, xyz] += value
+        feature_buf = cp.empty((4, weights.size))
+        direct_weight_stack = cp.asarray([
+            ordinary_weights[label] for label in density_labels
+        ] + [reference_weights_alpha, reference_weights_beta])
+        ao_upstream = ao.transpose(0, 2, 1)
+        for density, feature_weight in zip(
+                density_stack, direct_weight_stack):
+            feature_buf[...] = feature_weight * weights
+            feature_buf[0] *= 0.5
+            derivative = rks_grad._gga_grad_sum_(
+                ao_upstream, feature_buf,
+                buf=gradient_buf, out=matrix_buf,
+            )
+            ao_direct -= cp.einsum(
+                "xij,ij->ix", derivative, density,
+            )
+            ao_direct -= cp.einsum(
+                "xij,ji->ix", derivative, density,
+            )
+
+        if pair_labels:
+            special_weight_stack = cp.asarray([
+                special_weights[label] for label in pair_labels
+            ])
+            coefficient = coefficient_buf[:, :weights.size]
+            transpose = transpose_buf[:, :weights.size]
+            _contract_gga_pair_ao_rows(
+                ao_direct, ao, pair_density_stack, contracted_pair_ao,
+                special_weight_stack, weights, transpose, coefficient,
+            )
+
+    if with_direct and atmlst:
+        direct = cp.asarray([
+            ao_direct[offsets[atom][2]:offsets[atom][3]].sum(axis=0)
+            for atom in atmlst
+        ])
 
     q_alpha, q_beta = _project_channel_potentials(
         tdobj, potentials, blocks, target_spin=target_spin,
@@ -1093,78 +1238,122 @@ def gga_fockz_terms(
     if atmlst is None:
         atmlst = range(mol.natm)
     atmlst = tuple(atmlst)
-    density_open = spaces.c_open @ spaces.c_open.T
-    pz = 0.5 * (cp.asarray(pz) + cp.asarray(pz).T)
-    nao = mol.nao_nr()
-    open_potential = cp.zeros((nao, nao))
-    reference_alpha = cp.zeros((nao, nao))
-    reference_beta = cp.zeros_like(reference_alpha)
-    direct = cp.zeros((len(atmlst), 3))
+
+    opt = ni.gdftopt
+    if opt is None:
+        ni.build(mol, mf.grids.coords)
+        opt = ni.gdftopt
+    sorted_mol = opt._sorted_mol
+    nao = sorted_mol.nao
     mo = cp.asarray(mf.mo_coeff)
-    density_alpha = mo[:, mf.mo_occ > 0] @ mo[:, mf.mo_occ > 0].T
-    density_beta = mo[:, mf.mo_occ == 2] @ mo[:, mf.mo_occ == 2].T
-    density_stack = cp.stack((
-        pz, density_open, density_alpha, density_beta,
-    ))
-    offsets = mol.offset_nr_by_atom()
-    for ao, mask, weights, _coords in _block_loop(ni,
-            mol, mf.grids, nao, 2, max_memory=gradient_driver.max_memory):
-        rho0 = _eval_rho2(ni,
-            mol, ao, mo, mf.mo_occ, mask, "GGA", with_lapl=False,
+    mo = opt.sort_orbitals(mo, axis=[0])
+    c_open = opt.sort_orbitals(spaces.c_open, axis=[0])
+    density_open = c_open @ c_open.T
+    pz = 0.5 * (cp.asarray(pz) + cp.asarray(pz).T)
+    pz = opt.sort_orbitals(pz, axis=[0, 1])
+    density_buf = cp.empty(nao * nao)
+    shls_slice = (0, sorted_mol.nbas)
+    ao_loc = sorted_mol.ao_loc_nr()
+    if with_direct:
+        density_alpha = (
+            mo[:, mf.mo_occ > 0] @ mo[:, mf.mo_occ > 0].T
+        )
+        density_beta = (
+            mo[:, mf.mo_occ == 2] @ mo[:, mf.mo_occ == 2].T
+        )
+        direct_densities = (density_open, density_alpha, density_beta)
+        vmats = cp.zeros((3, 4, nao, nao))
+        potentials = vmats[:, 0]
+        ao_direct = cp.zeros((nao, 3))
+        gradient_buf = cp.empty(3 * nao * numint.MIN_BLK_SIZE)
+        matrix_buf = cp.empty(3 * nao * nao)
+        ao_deriv = 2
+    else:
+        potentials = cp.zeros((3, nao, nao))
+        direct = cp.zeros((len(atmlst), 3))
+        ao_deriv = 1
+
+    for ao, mask, weights, _coords in ni.block_loop(
+            sorted_mol, mf.grids, nao, ao_deriv,
+            max_memory=gradient_driver.max_memory):
+        rho0 = ni.eval_rho2(
+            sorted_mol, ao, mo[mask], mf.mo_occ, mask, "GGA",
+            with_lapl=False,
         ) * 0.5
         fref, kref_alpha, kref_beta = _gga_fref_kref(mf, rho0)
-        rho_pz = _eval_rho(ni,
-            mol, ao, pz, mask, "GGA", hermi=1, with_lapl=False,
-        )
-        rho_open = _eval_rho(ni,
-            mol, ao, density_open, mask, "GGA", hermi=1,
+        pz_mask = take_last2d(pz, mask, out=density_buf)
+        rho_pz = ni.eval_rho(
+            sorted_mol, ao, pz_mask, mask, "GGA", hermi=1,
             with_lapl=False,
         )
-        add_gga_matrix(
-            open_potential,
-            ao,
-            0.5 * cp.einsum("xyg,yg->xg", fref, rho_pz) * weights,
+        open_mask = take_last2d(density_open, mask, out=density_buf)
+        rho_open = ni.eval_rho(
+            sorted_mol, ao, open_mask, mask, "GGA", hermi=1,
+            with_lapl=False,
         )
         pair = 0.5 * cp.einsum("xg,yg->xyg", rho_pz, rho_open)
-        reference_alpha += gga_eval_matrix(
-            mol, ao, cp.einsum("xyg,xyzg->zg", pair, kref_alpha) * weights,
-            mask,
+        feature_weights = (
+            0.5 * cp.einsum("xyg,yg->xg", fref, rho_pz),
+            cp.einsum("xyg,xyzg->zg", pair, kref_alpha),
+            cp.einsum("xyg,xyzg->zg", pair, kref_beta),
         )
-        reference_beta += gga_eval_matrix(
-            mol, ao, cp.einsum("xyg,xyzg->zg", pair, kref_beta) * weights,
-            mask,
-        )
-        if not with_direct:
-            continue
-        for k, atom in enumerate(atmlst):
-            p0, p1 = offsets[atom][2:]
-            derivative_batches = _hermitian_density_derivative_batches(
-                ao, density_stack, p0, p1, "GGA",
+        if with_direct:
+            for vmat, feature_weight in zip(vmats, feature_weights):
+                weighted = cp.ascontiguousarray(feature_weight * weights)
+                tdrks_grad._gga_eval_mat_(
+                    sorted_mol, vmat, ao, weighted, mask,
+                    shls_slice, ao_loc,
+                )
+        else:
+            for potential, feature_weight in zip(
+                    potentials, feature_weights):
+                weighted = cp.ascontiguousarray(feature_weight * weights)
+                weighted[0] *= 0.5
+                scaled = numint._scale_ao(ao[:4], weighted)
+                matrix = numint._dot_ao_ao(
+                    sorted_mol, ao[0], scaled, mask,
+                    shls_slice, ao_loc,
+                )
+                add_sparse(potential, matrix + matrix.T, mask)
+
+        if with_direct:
+            pz_weights = cp.ascontiguousarray(
+                0.5 * cp.einsum(
+                    "xyg,yg->xg", fref, rho_open,
+                ) * weights
             )
-            for xyz, derivatives in enumerate(derivative_batches):
-                drho_pz, drho_open, drho_alpha, drho_beta = derivatives
-                direct[k, xyz] += 0.5 * cp.einsum(
-                    "xg,xyg,yg,g->", drho_pz, fref, rho_open, weights,
-                )
-                direct[k, xyz] += 0.5 * cp.einsum(
-                    "xg,xyg,yg,g->", rho_pz, fref, drho_open, weights,
-                )
-                direct[k, xyz] += cp.einsum(
-                    "xyg,xyzg,zg,g->",
-                    pair, kref_alpha, drho_alpha, weights,
-                )
-                direct[k, xyz] += cp.einsum(
-                    "xyg,xyzg,zg,g->",
-                    pair, kref_beta, drho_beta, weights,
-                )
+            pz_weights[0] *= 0.5
+            derivative = rks_grad._gga_grad_sum_(
+                ao, pz_weights, buf=gradient_buf, out=matrix_buf,
+            )
+            pz_mask = take_last2d(pz, mask, out=density_buf)
+            ao_direct[mask] -= 2.0 * cp.einsum(
+                "xij,ij->ix", derivative, pz_mask,
+            )
+
+    if with_direct:
+        for vmat, density in zip(vmats, direct_densities):
+            ao_direct -= 2.0 * cp.einsum(
+                "xij,ij->ix", vmat[1:], density,
+            )
+        direct = _reduce_sorted_ao_to_atoms(
+            sorted_mol, ao_direct, atmlst,
+        )
 
     q_alpha = cp.zeros((mo.shape[1], mo.shape[1]))
     q_beta = cp.zeros_like(q_alpha)
     q_alpha[:, spaces.open] += (
-        mo.conj().T @ (open_potential + open_potential.T) @ spaces.c_open
+        mo.conj().T @ (potentials[0] + potentials[0].T) @ c_open
     )
-    _add_reference_q(
-        tdobj, q_alpha, q_beta, reference_alpha, reference_beta,
+    occupied_alpha = cp.flatnonzero(mf.mo_occ > 0)
+    occupied_beta = cp.flatnonzero(mf.mo_occ == 2)
+    q_alpha[:, occupied_alpha] += (
+        mo.conj().T @ (potentials[1] + potentials[1].T)
+        @ mo[:, occupied_alpha]
+    )
+    q_beta[:, occupied_beta] += (
+        mo.conj().T @ (potentials[2] + potentials[2].T)
+        @ mo[:, occupied_beta]
     )
     return XCGradientTerms(q_alpha, q_beta, direct)
 
