@@ -24,7 +24,7 @@ from nest.soc.soc import SOCBase, SpinFreeState, clebsch_gordan_rank1
 
 
 class SOC(SOCBase):
-    """Build SOC states from converged NTTDA ``deltaS=0/-1`` objects."""
+    """Build SOC states from converged NTTDA ``deltaS=+1/0/-1`` objects."""
 
     _keys = {'tds', 'include_reference', 'orbitals'}
 
@@ -80,9 +80,9 @@ class SOC(SOCBase):
         states, has_delta0 = self._collect_states(self.tds, self.include_reference)
         if not has_delta0:
             if self.include_reference:
-                logger.info(self, 'Only deltaS=-1 states are provided; reference state is included.')
+                logger.info(self, 'No deltaS=0 states are provided; reference state is included.')
             else:
-                logger.info(self, 'Only deltaS=-1 states are provided; reference state is NOT included.')
+                logger.info(self, 'No deltaS=0 states are provided; reference state is NOT included.')
                 logger.info(self, 'To include the reference state, set include_reference=True before running SOC.')
         return states
 
@@ -111,10 +111,8 @@ class SOC(SOCBase):
 
         for tdobj in tdobjs:
             delta_s = int(getattr(tdobj, 'deltaS', getattr(tdobj, 'DeltaS', 99)))
-            if delta_s == 1:
-                raise NotImplementedError('NTTDA SOC currently only supports deltaS=0 and deltaS=-1')
-            if delta_s not in (0, -1):
-                raise ValueError('deltaS should be 0 or -1')
+            if delta_s not in (1, 0, -1):
+                raise ValueError('deltaS should be -1, 0, or 1')
             if getattr(tdobj, 'e', None) is None or getattr(tdobj, 'xy', None) is None:
                 raise ValueError('Run the NTTDA kernel before SOC')
 
@@ -123,7 +121,9 @@ class SOC(SOCBase):
             if spin < 0:
                 raise ValueError('Invalid final spin inferred from deltaS')
             for root, energy in enumerate(tdobj.e):
-                if delta_s == 0:
+                if delta_s == 1:
+                    amplitude = self._unpack_deltap1(tdobj, root, nc, nv)
+                elif delta_s == 0:
                     amplitude = self._unpack_delta0(tdobj, root, nc, no, nv)
                 else:
                     amplitude = self._unpack_deltam1(tdobj, root, nc, no, nv)
@@ -157,6 +157,10 @@ class SOC(SOCBase):
         return states, has_delta0
 
     @staticmethod
+    def _unpack_deltap1(tdobj, root, nc, nv):
+        return tdobj.xy[root][0].reshape(nc, nv)
+
+    @staticmethod
     def _unpack_delta0(tdobj, root, nc, no, nv):
         slices = _sc_vector_slices(nc, no, nv)
         x = tdobj.xy[root][0].reshape(-1)
@@ -176,6 +180,43 @@ class SOC(SOCBase):
     @staticmethod
     def _add(gamma, rows, cols, block):
         gamma[np.ix_(rows, cols)] += block
+
+    def _gamma_deltap1_deltap1(self, bra, ket):
+        """Return ``<S+1,S+1|T^0_pq|S+1,S+1>`` in the MO basis."""
+        cidx, _, vidx, nmo = self.orbitals
+        gamma = np.zeros((nmo, nmo))
+        b_cv = bra.amplitude
+        k_cv = ket.amplitude
+        factor = 1.0 / np.sqrt(2.0)
+
+        # CV(ai)-CV(bj): p=j,q=i and p=a,q=b, respectively.
+        self._add(gamma, cidx, cidx, factor * lib.einsum('ia,ja->ji', b_cv, k_cv))
+        self._add(gamma, vidx, vidx, factor * lib.einsum('ia,ib->ab', b_cv, k_cv))
+        return gamma
+
+    def _gamma_deltap1_delta0(self, bra, ket):
+        """Return ``<S+1,S+1|T^1_pq|S,S>`` in the MO basis."""
+        s = ket.spin
+        cidx, oidx, vidx, nmo = self.orbitals
+        gamma = np.zeros((nmo, nmo))
+        b_cv = bra.amplitude
+        k_oo, k_co, k_cv, k_ov, k_cv0 = ket.amplitude
+        f_cvcv = np.sqrt(s / (2.0 * (s + 1.0)))
+
+        # CV(ai)-OO, -CO(vj), and -OV(bv).
+        self._add(gamma, vidx, cidx, -k_oo * b_cv.T)
+        self._add(gamma, vidx, oidx, lib.einsum('ia,iv->av', b_cv, k_co))
+        self._add(gamma, oidx, cidx, lib.einsum('ia,va->vi', b_cv, k_ov))
+
+        # CV(ai)-CV(bj).
+        self._add(gamma, cidx, cidx, f_cvcv * lib.einsum('ia,ja->ji', b_cv, k_cv))
+        self._add(gamma, vidx, vidx, f_cvcv * lib.einsum('ia,ib->ab', b_cv, k_cv))
+
+        # CV(ai)-CV0(bj): opposite signs for the core and virtual blocks.
+        factor = 1.0 / np.sqrt(2.0)
+        self._add(gamma, cidx, cidx, -factor * lib.einsum('ia,ja->ji', b_cv, k_cv0))
+        self._add(gamma, vidx, vidx, factor * lib.einsum('ia,ib->ab', b_cv, k_cv0))
+        return gamma
 
     def _gamma_delta0_delta0(self, bra, ket):
         s = bra.spin
@@ -301,6 +342,9 @@ class SOC(SOCBase):
         if abs(bra.spin - ket.spin) < 1e-12:
             if abs(bra.spin) < 1e-12:
                 gamma_mo = np.zeros((self.orbitals[3], self.orbitals[3]))
+            elif bra.delta_s == 1 and ket.delta_s == 1:
+                coefficient = clebsch_gordan_rank1(bra.spin, bra.spin, 0, bra.spin, bra.spin)
+                gamma_mo = self._gamma_deltap1_deltap1(bra, ket) / coefficient
             elif bra.delta_s == 0 and ket.delta_s == 0:
                 coefficient = clebsch_gordan_rank1(bra.spin, bra.spin, 0, bra.spin, bra.spin)
                 gamma_mo = self._gamma_delta0_delta0(bra, ket) / coefficient
@@ -310,10 +354,14 @@ class SOC(SOCBase):
             else:
                 raise NotImplementedError('NTTDA SOC supports matching deltaS blocks only')
         elif abs(bra.spin - ket.spin - 1) < 1e-12:
-            if bra.delta_s != 0 or ket.delta_s != -1:
-                raise NotImplementedError('NTTDA SOC supports deltaS=0 <- deltaS=-1 only')
+            if bra.delta_s == 1 and ket.delta_s == 0:
+                gamma_mo = self._gamma_deltap1_delta0(bra, ket)
+            elif bra.delta_s == 0 and ket.delta_s == -1:
+                gamma_mo = self._gamma_delta0_deltam1(bra, ket)
+            else:
+                raise NotImplementedError('Unsupported NTTDA SOC transition block')
             coefficient = clebsch_gordan_rank1(ket.spin, ket.spin, 1, bra.spin, bra.spin)
-            gamma_mo = self._gamma_delta0_deltam1(bra, ket) / coefficient
+            gamma_mo /= coefficient
         else:
             raise NotImplementedError('Use the Hermitian-conjugate order for lowering spin blocks')
 
