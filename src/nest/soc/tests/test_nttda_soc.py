@@ -86,15 +86,17 @@ class KnownValues(unittest.TestCase):
             1e-5,
         )
 
-    def test_delta0_deltam1_soc_without_reference(self):
+    def test_all_delta_s_soc_without_reference(self):
         mf = self.mol.ROKS(xc='SVWN').run()
         td0 = nttda.NTTDA(mf).set(deltaS=0, nstates=1, verbose=0).run()
         tdm1 = nttda.NTTDA(mf).set(deltaS=-1, nstates=2, verbose=0).run()
-        driver = td0.SOC(tdm1, soctype='SOMF', include_reference=False).run()
+        tdp1 = nttda.NTTDA(mf).set(deltaS=1, nstates=2, verbose=0).run()
+        driver = td0.SOC(tdm1, tdp1, soctype='SOMF', include_reference=False).run()
 
         self.assertTrue(mf.converged)
         self.assertTrue(np.all(td0.converged))
         self.assertTrue(np.all(tdm1.converged))
+        self.assertTrue(np.all(tdp1.converged))
         self.assertAlmostEqual(mf.e_tot, -150.18173594947874, delta=1e-5)
         np.testing.assert_allclose(td0.e, [
             -0.00141029197365759,
@@ -102,16 +104,32 @@ class KnownValues(unittest.TestCase):
         np.testing.assert_allclose(tdm1.e, [
             -0.2117097904730021, 0.02304623644417658,
         ], atol=1e-5, rtol=0)
+        np.testing.assert_allclose(tdp1.e, [
+            0.2621305574453343, 0.3146577468617749,
+        ], atol=1e-5, rtol=0)
 
-        self.assertEqual(len(driver.states), 3)
+        self.assertEqual(len(driver.states), 5)
         self.assertTrue(all(state.source is not None for state in driver.states))
-        self.assertEqual(driver.h_soc.shape, (5, 5))
+        self.assertEqual(driver.h_soc.shape, (15, 15))
         np.testing.assert_allclose(driver.h_soc, driver.h_soc.conj().T, atol=1e-12)
         np.testing.assert_allclose(
             (driver.e - driver.e.min()).real * HARTREE2WAVENUMBER,
             [
-                0.0, 46155.408911919854, 46155.41103102725,
-                46155.415973766896, 51523.00193435802,
+                0.0,
+                46155.39350494409,
+                46155.39675069523,
+                46155.40053664649,
+                51523.00193431141,
+                103995.93505525426,
+                103995.93540549738,
+                103995.94402784202,
+                103995.94792356089,
+                103995.94984934888,
+                115524.32871746294,
+                115524.33017374968,
+                115524.3346171531,
+                115524.34193573268,
+                115524.342433624,
             ],
             atol=1e-4, rtol=0,
         )
@@ -125,6 +143,37 @@ class KnownValues(unittest.TestCase):
             ]),
             1e-5,
         )
+        assert_allclose_up_to_sign(
+            self,
+            driver.get_block(3, 0) * HARTREE2WAVENUMBER,
+            np.array([
+                [4.291356376707217 + 0.8683742423491343j, 0.0, 0.0],
+                [22.058947162257795j, 3.034447194457806 + 0.6140333153728034j, 0.0],
+                [1.751938904561919 - 0.3545122999218864j, 25.47147816433854j,
+                 1.751938904561919 + 0.3545122999218864j],
+                [0.0, 3.034447194457806 - 0.6140333153728034j, 22.058947162257795j],
+                [0.0, 0.0, 4.291356376707217 - 0.8683742423491343j],
+            ]),
+            1e-5,
+        )
+        assert_allclose_up_to_sign(
+            self,
+            driver.get_block(4, 3) * HARTREE2WAVENUMBER,
+            np.array([
+                [3.7686984455282424j, -4.890015722888963 - 1.4176754459558178j,
+                 0.0, 0.0, 0.0],
+                [4.890015722888963 - 1.4176754459558178j, 1.8843492227641212j,
+                 -5.989021677632492 - 1.7362907317321719j, 0.0, 0.0],
+                [0.0, 5.989021677632492 - 1.7362907317321719j, 0.0,
+                 -5.989021677632492 - 1.7362907317321719j, 0.0],
+                [0.0, 0.0, 5.989021677632492 - 1.7362907317321719j,
+                 -1.8843492227641212j, -4.890015722888963 - 1.4176754459558178j],
+                [0.0, 0.0, 0.0, 4.890015722888963 - 1.4176754459558178j,
+                 -3.7686984455282424j],
+            ]),
+            1e-5,
+        )
+        np.testing.assert_array_equal(driver.get_block(3, 1), np.zeros((5, 1)))
 
 
 if __name__ == '__main__':

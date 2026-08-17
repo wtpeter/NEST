@@ -842,6 +842,7 @@ class NTTDA(TDBase):
             self.e = self.e[mask]
             self.xy = [xy for xy, keep in zip(self.xy, mask) if keep]
             self.nstates = len(self.e)
+            self.converged = self.converged[mask]
         elif self.deltaS == 1:
             self.xy = [(xi.reshape(ncs, nvs), 0) for xi in x1]
 
