@@ -163,6 +163,44 @@ class KnownValues(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, 'gpu4pyscf ROKS'):
             nttda_module.NTTDA(self.mol.ROKS(xc='HF'))
 
+    def test_get_ab_matches_vind(self):
+        mol = gto.M(
+            atom='O 0 0 0; O 0 0 1.2',
+            basis='sto-3g',
+            spin=2,
+            verbose=0,
+        )
+        cases = (
+            ('HF', False, (1, 0, -1)),
+            ('SVWN', False, (0,)),
+            ('PBE', False, (-1,)),
+            ('TPSS', False, (1,)),
+            ('M062X', False, (0,)),
+            ('CAM-B3LYP', False, (-1,)),
+            ('CAM-B3LYP', True, (1, 0, -1)),
+        )
+        methods = {
+            1: 'gen_vind_sfu',
+            0: 'gen_vind_sc',
+            -1: 'gen_vind_sfd',
+        }
+        rng = np.random.default_rng(8)
+        for xc, density_fit, delta_spins in cases:
+            mf = mol.ROKS(xc=xc).to_gpu()
+            if density_fit:
+                mf = mf.density_fit()
+            mf.run()
+            for delta_s in delta_spins:
+                td = mf.NTTDA().set(deltaS=delta_s)
+                vind, hdiag = getattr(td, methods[delta_s])()
+                matrix = td.get_ab()
+                vectors = rng.standard_normal((2, hdiag.size))
+                actual = cp.asnumpy(vind(cp.asarray(vectors)))
+                self.assertIsInstance(matrix, np.ndarray)
+                np.testing.assert_allclose(
+                    actual, vectors @ matrix.T, atol=1e-8, rtol=0,
+                )
+
     def test_cpu_only_import(self):
         code = "import sys; import nest; assert 'cupy' not in sys.modules"
         subprocess.run([sys.executable, '-c', code], check=True)
