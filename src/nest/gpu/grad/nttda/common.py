@@ -6,6 +6,7 @@ import cupy as cp
 import numpy as np
 
 from gpu4pyscf.df import int3c2e
+from gpu4pyscf.df.df_jk import _DFHF
 from gpu4pyscf.grad import rhf as rhf_grad
 
 from nest.gpu.nttda import nttda as nttda_mod
@@ -257,22 +258,26 @@ class JKDerivativeLedger:
 
     def contract(self, gradient_driver, mol, atoms, slots=()):
         atoms = tuple(atoms)
+        density_fitted = isinstance(gradient_driver.base._scf, _DFHF)
         gradients = {
             slot: cp.zeros((len(atoms), 3), dtype=cp.float64)
             for slot in slots
         }
-        terms_by_omega = {}
+        grouped_terms = {}
+        # The conventional multidm kernel races; DF batching is stable and
+        # avoids rebuilding its integral optimizer separately for every slot.
         for operator in ("j", "k"):
             for term in self._terms[operator]:
                 gradients.setdefault(
                     term.slot,
                     cp.zeros((len(atoms), 3), dtype=cp.float64),
                 )
-                terms_by_omega.setdefault(term.omega, []).append(
+                group_slot = None if density_fitted else term.slot
+                grouped_terms.setdefault((term.omega, group_slot), []).append(
                     (operator, term)
                 )
 
-        for omega, terms in terms_by_omega.items():
+        for (omega, slot), terms in grouped_terms.items():
             dm_pairs = []
             j_factors = []
             k_factors = []
@@ -290,13 +295,18 @@ class JKDerivativeLedger:
                 j_factor=j_factors,
                 k_factor=k_factors,
                 omega=0.0 if omega is None else omega,
-                sum_results=False,
+                sum_results=not density_fitted,
             )
             values = cp.asarray(values)
-            if atoms != tuple(range(mol.natm)):
-                values = values[:, atoms]
-            for value, (_operator, term) in zip(values, terms):
-                gradients[term.slot] += value
+            if density_fitted:
+                if atoms != tuple(range(mol.natm)):
+                    values = values[:, atoms]
+                for value, (_operator, term) in zip(values, terms):
+                    gradients[term.slot] += value
+            else:
+                if atoms != tuple(range(mol.natm)):
+                    values = values[atoms]
+                gradients[slot] += values
         return gradients
 
 

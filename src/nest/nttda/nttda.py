@@ -841,6 +841,7 @@ class NTTDA(TDBase):
             mask = abs(self.e) > 1e-8
             self.e = self.e[mask]
             self.xy = [xy for xy, keep in zip(self.xy, mask) if keep]
+            self.converged = self.converged[mask]
             self.nstates = len(self.e)
         elif self.deltaS == 1:
             self.xy = [(xi.reshape(ncs, nvs), 0) for xi in x1]

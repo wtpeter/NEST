@@ -2,8 +2,10 @@ import unittest
 
 import cupy as cp
 import numpy as np
+from gpu4pyscf.df.df_jk import _DFHF
 from pyscf import gto
 
+from nest.gpu.grad.nttda.common import JKDerivativeLedger
 from nest.gpu.nttda import NTTDA as GPUNTTDA
 
 
@@ -43,6 +45,71 @@ class NTTDAGradientKnownValues(unittest.TestCase):
         self.assertIsInstance(gradient.nttda_details.zvector, cp.ndarray)
         self.assertLess(gradient.nttda_details.residual, 1e-5)
         return actual
+
+    def test_jk_ledger_selects_stable_backend_contractions(self):
+        mol = self.molecule()
+        density = cp.eye(mol.nao)
+        calls = []
+
+        class GradientDriver:
+            def __init__(self, scf):
+                self.base = type("Base", (), {"_scf": scf})()
+
+            def jk_energies_per_atom(
+                    self, dm_pairs, j_factor, k_factor, omega,
+                    sum_results):
+                assert dm_pairs.ndim == 4
+                calls.append((
+                    omega, tuple(j_factor), tuple(k_factor), sum_results,
+                ))
+                if sum_results:
+                    scale = omega + sum(j_factor) + sum(k_factor)
+                    return cp.full((mol.natm, 3), scale)
+                return cp.stack([
+                    cp.full((mol.natm, 3), omega + j + k)
+                    for j, k in zip(j_factor, k_factor)
+                ])
+
+        ledger = JKDerivativeLedger()
+        ledger.add("j", "a", (
+            (density, density, 0.5, None),
+            (density, density, 0.25, 0.3),
+        ))
+        ledger.add("k", "a", (
+            (density, density, 0.125, None),
+        ))
+        ledger.add("j", "b", (
+            (density, density, 0.75, None),
+        ))
+
+        gradients = ledger.contract(
+            GradientDriver(object()),
+            mol,
+            range(mol.natm),
+            slots=("a", "b"),
+        )
+
+        self.assertEqual(calls, [
+            (0.0, (1.0, 0.0), (0.0, -0.5), True),
+            (0.3, (0.5,), (0.0,), True),
+            (0.0, (1.5,), (0.0,), True),
+        ])
+        np.testing.assert_allclose(cp.asnumpy(gradients["a"]), 1.3)
+        np.testing.assert_allclose(cp.asnumpy(gradients["b"]), 1.5)
+
+        calls.clear()
+        gradients = ledger.contract(
+            GradientDriver(object.__new__(_DFHF)),
+            mol,
+            range(mol.natm),
+            slots=("a", "b"),
+        )
+        self.assertEqual(calls, [
+            (0.0, (1.0, 1.5, 0.0), (0.0, 0.0, -0.5), False),
+            (0.3, (0.5,), (0.0,), False),
+        ])
+        np.testing.assert_allclose(cp.asnumpy(gradients["a"]), 1.3)
+        np.testing.assert_allclose(cp.asnumpy(gradients["b"]), 1.5)
 
     def test_analytic_against_cpu(self):
         cases = (

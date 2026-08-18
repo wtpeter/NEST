@@ -183,6 +183,12 @@ class KnownValues(unittest.TestCase):
             orbvs = mo_coeff[:, mo_occ == 0]
             zs = rng.standard_normal((2, orbcs.shape[1], orbvs.shape[1]))
             dms = np.einsum('xia,pa,qi->xpq', zs, orbvs, orbcs)
+            left = cp.einsum(
+                'xia,pa->xpi', cp.asarray(zs), cp.asarray(orbvs),
+            )
+            factorized_dms = nttda_module._factorized_density(
+                left, cp.asarray(orbcs),
+            )
 
             ni_cpu = ni.to_cpu()
             grids_cpu = gen_grid.Grids(self.mol)
@@ -211,7 +217,15 @@ class KnownValues(unittest.TestCase):
                 fxc_cpu,
             )
             self.assertIsInstance(actual, cp.ndarray)
+            actual_factorized = gpu_fn(
+                ni, self.mol, mf.grids, xc, factorized_dms,
+                cp.asarray(fxc_cpu),
+            )
             np.testing.assert_allclose(cp.asnumpy(actual), expected, atol=1e-10, rtol=1e-10)
+            np.testing.assert_allclose(
+                cp.asnumpy(actual_factorized), expected,
+                atol=1e-10, rtol=1e-10,
+            )
             np.testing.assert_allclose(cp.asnumpy(actual_gpu_fxc), expected, atol=1e-8, rtol=1e-8)
 
 

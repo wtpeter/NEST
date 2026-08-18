@@ -23,7 +23,7 @@ import numpy as np
 from pyscf import lib
 from gpu4pyscf import dft
 from gpu4pyscf.lib import logger
-from gpu4pyscf.lib.cupy_helper import add_sparse, contract
+from gpu4pyscf.lib.cupy_helper import add_sparse, contract, tag_array
 from gpu4pyscf.tdscf._lr_eig import eigh as lr_eigh
 from gpu4pyscf.tdscf.rhf import TDA
 
@@ -94,6 +94,42 @@ def nr_rks_fxc1_gga(ni, mol, grids, xc_code, dms, fxc, max_memory=2000):
 
 def nr_rks_fxc1_mgga(ni, mol, grids, xc_code, dms, fxc, max_memory=2000):
     return _nr_rks_fxc1(ni, mol, grids, dms, fxc, mgga=True)
+
+
+def _factorized_density(left, right, columns=None):
+    """Build directed AO densities with reusable low-rank factors."""
+    if columns is not None:
+        padded = cp.zeros(
+            left.shape[:-1] + (right.shape[-1],), dtype=left.dtype,
+        )
+        padded[..., columns] = left
+        left = padded
+    density = contract('xpi,qi->xpq', left, right)
+    return tag_array(
+        density,
+        mo1=left,
+        # nr_rks_fxc doubles tagged occ_coeff before eval_rho4.
+        occ_coeff=right * 0.5,
+        factor_l=left,
+        factor_r=right,
+        symmetrize=0,
+    )
+
+
+def _concatenate_factorized_densities(densities):
+    density = cp.concatenate(densities, axis=0)
+    if not all(hasattr(item, 'mo1') for item in densities):
+        return density
+    left = cp.concatenate([item.mo1 for item in densities], axis=0)
+    right = densities[0].factor_r
+    return tag_array(
+        density,
+        mo1=left,
+        occ_coeff=densities[0].occ_coeff,
+        factor_l=left,
+        factor_r=right,
+        symmetrize=0,
+    )
 
 
 def gen_rohf_response_sfu(mf, mo_coeff=None, mo_occ=None, hermi=0, max_memory=None, log=None):
@@ -203,8 +239,10 @@ def gen_rohf_response_sc(mf, mo_coeff=None, mo_occ=None, hermi=0, max_memory=Non
         v1ao_ov = cp.zeros_like(dms_ov)
         v1ao_cv0 = cp.zeros_like(dms_cv0)
 
-        dms0 = cp.concatenate((dms_co, dms_cv, dms_ov, dms_cv0), axis=0)
-        dms1 = cp.concatenate((dms_co, dms_ov, dms_cv0), axis=0)
+        dms0 = _concatenate_factorized_densities(
+            (dms_co, dms_cv, dms_ov, dms_cv0),
+        )
+        dms1 = _concatenate_factorized_densities((dms_co, dms_ov, dms_cv0))
 
         # kernel part
         if xctype != 'HF':
@@ -231,7 +269,9 @@ def gen_rohf_response_sc(mf, mo_coeff=None, mo_occ=None, hermi=0, max_memory=Non
             if omega != 0:
                 vk += mf.get_k(mol, dms0, hermi, omega=omega) * (alpha - hyb)
                 with mol.with_range_coulomb(omega):
-                    vj += mf.get_j(mol, dms1, hermi) * (alpha - hyb)
+                    vj += mf.get_j(
+                        mol, dms1, hermi, omega=omega
+                    ) * (alpha - hyb)
             vref0 -= vk
             vref1 -= vj
             log.timer('NTTDA response_sc kernel get_j/get_k total', *time_jk)
@@ -313,8 +353,10 @@ def gen_rohf_response_sfd(mf, mo_coeff=None, mo_occ=None, hermi=0, max_memory=No
         v1ao_oo = cp.zeros_like(dms_oo)
         v1ao_ov = cp.zeros_like(dms_ov)
 
-        dms0 = cp.concatenate((dms_co, dms_cv, dms_oo, dms_ov), axis=0)
-        dms1 = cp.concatenate((dms_co, dms_ov), axis=0)
+        dms0 = _concatenate_factorized_densities(
+            (dms_co, dms_cv, dms_oo, dms_ov),
+        )
+        dms1 = _concatenate_factorized_densities((dms_co, dms_ov))
 
         if xctype != 'HF':
             time_xc = (logger.process_clock(), logger.perf_counter())
@@ -341,7 +383,9 @@ def gen_rohf_response_sfd(mf, mo_coeff=None, mo_occ=None, hermi=0, max_memory=No
             if omega != 0:
                 vk += mf.get_k(mol, dms0, hermi, omega=omega) * (alpha - hyb)
                 with mol.with_range_coulomb(omega):
-                    vj += mf.get_j(mol, dms1, hermi) * (alpha - hyb)
+                    vj += mf.get_j(
+                        mol, dms1, hermi, omega=omega
+                    ) * (alpha - hyb)
             vref0 -= vk
             vref1 -= vj
             log.timer('NTTDA response_sf get_j/get_k total', *time_jk)
@@ -435,8 +479,8 @@ def gen_vind_sfu(td):
     def vind(zs):
         time0 = time1 = (logger.process_clock(), logger.perf_counter())
         zs = cp.asarray(zs).reshape(-1, ncs, nvs)
-        dms_cv = contract('xia,pa->xip', zs, orbvs)
-        dms_cv = contract('xip,qi->xpq', dms_cv, orbcs.conj())
+        mo1_cv = contract('xia,pa->xpi', zs, orbvs)
+        dms_cv = _factorized_density(mo1_cv, orbcs.conj())
         time1 = log.timer('NTTDA gen_vind_sfu make density matrices', *time1)
 
         v1ao_cv = vresp(dms_cv)
@@ -526,14 +570,21 @@ def gen_vind_sc(td):
         zs_oo = zs[:, slices['OO(1)']].reshape(-1, 1)
         zs_ov = zs[:, slices['OV(1)']].reshape(-1, nos, nvs)
         zs_cv0 = zs[:, slices['CV(0)']].reshape(-1, ncs, nvs)
-        dms_co = contract('xov,pv->xpo', zs_co, orbos)
-        dms_co = contract('xpo,qo->xpq', dms_co, orbcs.conj())
-        dms_cv = contract('xov,pv->xpo', zs_cv, orbvs)
-        dms_cv = contract('xpo,qo->xpq', dms_cv, orbcs.conj())
-        dms_ov = contract('xov,pv->xpo', zs_ov, orbvs)
-        dms_ov = contract('xpo,qo->xpq', dms_ov, orbos.conj())
-        dms_cv0 = contract('xov,pv->xpo', zs_cv0, orbvs)
-        dms_cv0 = contract('xpo,qo->xpq', dms_cv0, orbcs.conj())
+        right = cp.concatenate((orbcs.conj(), orbos.conj()), axis=1)
+        core = slice(None, ncs)
+        open_ = slice(ncs, None)
+        dms_co = _factorized_density(
+            contract('xov,pv->xpo', zs_co, orbos), right, core,
+        )
+        dms_cv = _factorized_density(
+            contract('xov,pv->xpo', zs_cv, orbvs), right, core,
+        )
+        dms_ov = _factorized_density(
+            contract('xov,pv->xpo', zs_ov, orbvs), right, open_,
+        )
+        dms_cv0 = _factorized_density(
+            contract('xov,pv->xpo', zs_cv0, orbvs), right, core,
+        )
         time1 = log.timer('NTTDA gen_vind_sc make density matrices', *time1)
         v1ao_co, v1ao_cv, v1ao_ov, v1ao_cv0 = vresp(dms_co, dms_cv, dms_ov, dms_cv0)
         time1 = log.timer('NTTDA gen_vind_sc response vind total', *time1)
@@ -672,14 +723,21 @@ def gen_vind_sfd(td):
         zs_cv = zs[:, core_rows, virt_cols]
         zs_oo = zs[:, open_rows, open_cols]
         zs_ov = zs[:, open_rows, virt_cols]
-        dms_co = contract('xov,pv->xpo', zs_co, orbos)
-        dms_co = contract('xpo,qo->xpq', dms_co, orbcs.conj())
-        dms_cv = contract('xov,pv->xpo', zs_cv, orbvs)
-        dms_cv = contract('xpo,qo->xpq', dms_cv, orbcs.conj())
-        dms_oo = contract('xov,pv->xpo', zs_oo, orbos)
-        dms_oo = contract('xpo,qo->xpq', dms_oo, orbos.conj())
-        dms_ov = contract('xov,pv->xpo', zs_ov, orbvs)
-        dms_ov = contract('xpo,qo->xpq', dms_ov, orbos.conj())
+        right = cp.concatenate((orbcs.conj(), orbos.conj()), axis=1)
+        core = slice(None, ncs)
+        open_ = slice(ncs, None)
+        dms_co = _factorized_density(
+            contract('xov,pv->xpo', zs_co, orbos), right, core,
+        )
+        dms_cv = _factorized_density(
+            contract('xov,pv->xpo', zs_cv, orbvs), right, core,
+        )
+        dms_oo = _factorized_density(
+            contract('xov,pv->xpo', zs_oo, orbos), right, open_,
+        )
+        dms_ov = _factorized_density(
+            contract('xov,pv->xpo', zs_ov, orbvs), right, open_,
+        )
         time1 = log.timer('NTTDA gen_vind_sfd make density matrices', *time1)
         v1ao_co, v1ao_cv, v1ao_oo, v1ao_ov = vresp(dms_co, dms_cv, dms_oo, dms_ov)
         time1 = log.timer('NTTDA gen_vind_sfd response vind total', *time1)
