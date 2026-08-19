@@ -39,6 +39,7 @@ class SpinFreeState:
     label: str
     spin_square: float | None = None
     delta_s: int | None = None
+    spin_free_index: int | None = None
 
 
 def clebsch_gordan_rank1(j1, m1, q, j, m):
@@ -79,7 +80,7 @@ def clebsch_gordan_rank1(j1, m1, q, j, m):
 class SOCBase(lib.StreamObject):
     """Build and diagonalize a SOC Hamiltonian from scalar excited states."""
 
-    _keys = {'states', 'soctype', 'soc_ao', 'state_slices', 'h_soc', 'e', 'v'}
+    _keys = {'states', 'soctype', 'soc_ao', 'state_slices', 'h_soc', 'e', 'v', 's2'}
 
     def __init__(self, soctype='SOMF'):
         self._scf = None
@@ -93,6 +94,7 @@ class SOCBase(lib.StreamObject):
         self.h_soc = None
         self.e = None
         self.v = None
+        self.s2 = None
 
     def _initialize_states(self):
         """Build method-specific scalar states from the current options."""
@@ -139,10 +141,15 @@ class SOCBase(lib.StreamObject):
 
     def build_hamiltonian(self):
         self.states = list(self._initialize_states())
+        for state_id, state in enumerate(self.states, 1):
+            state.spin_free_index = state_id
+        log = logger.new_logger(self)
+        log.note('*** Spin-Orbit Coupling Calculation ***')
         self.state_slices = None
         self.h_soc = None
         self.e = None
         self.v = None
+        self.s2 = None
         self.soc_ao = get_ao_soc(self._scf, self.soctype)
         self.state_slices = []
         start = 0
@@ -176,6 +183,23 @@ class SOCBase(lib.StreamObject):
         self.build_hamiltonian()
         self.e, self.v = np.linalg.eigh(self.h_soc)
         return self.e, self.v
+
+    def spin_square(self):
+        """Return ``<S^2>`` for all spin-orbit-coupled eigenstates."""
+        if self.v is None or self.state_slices is None:
+            raise RuntimeError('Run kernel() before spin_square()')
+        dimensions = [
+            state_slice.stop - state_slice.start
+            for state_slice in self.state_slices
+        ]
+        scalar_s2 = np.array([
+            state.spin * (state.spin + 1)
+            for state in self.states
+        ])
+        basis_s2 = np.repeat(scalar_s2, dimensions)
+        weights = abs(self.v) ** 2
+        self.s2 = basis_s2 @ weights
+        return self.s2
 
     def get_block(self, bra, ket):
         if self.h_soc is None:
@@ -212,45 +236,62 @@ class SOCBase(lib.StreamObject):
         if self.h_soc is None or self.e is None:
             self.kernel()
         log = logger.new_logger(self, verbose)
-        log.note('SOC scalar states')
-        for state_id, state in enumerate(self.states):
-            message = 'State %d: %s  S=%s  E=%.8f Eh' % (
-                state_id + 1, state.label, state.spin, state.energy,
-            )
+        log.note('Spin-free states')
+        for state in self.states:
+            spin_square = ''
             if state.spin_square is not None:
-                message += '  <S^2>=%.6f' % state.spin_square
-            log.note(message)
+                spin_square = '<S^2>=%6.3f' % state.spin_square
+            log.note(
+                'State %3d:  S=%4.1f   E=%12.6f eV  %-3s  (%s)',
+                state.spin_free_index,
+                state.spin,
+                state.energy * HARTREE2EV,
+                spin_square,
+                state.label,
+            )
 
         for bra_id in range(len(self.states)):
             for ket_id in range(bra_id):
                 block = self.get_block(bra_id, ket_id)
                 bra = self.states[bra_id]
                 ket = self.states[ket_id]
-                log.note(
+                log.info(
                     'SOC block: state %d (%s, S=%s) <- state %d (%s, S=%s); '
                     'SOCC = %.6f cm^-1',
-                    bra_id + 1, bra.label, bra.spin,
-                    ket_id + 1, ket.label, ket.spin,
+                    bra.spin_free_index, bra.label, bra.spin,
+                    ket.spin_free_index, ket.label, ket.spin,
                     np.linalg.norm(block) * HARTREE2WAVENUMBER,
                 )
                 for line in self._format_soc_block(
                     block * HARTREE2WAVENUMBER, bra, ket,
                 ):
-                    log.info('%s', line)
+                    log.debug('%s', line)
 
         origin = self.e.min() if self.e.size else 0.0
         log.note('Spin-orbit-coupled eigenstates')
+        self.spin_square()
         for state_id, energy in enumerate(self.e):
-            log.note('State %d: Delta E = %.6f cm^-1 (%.8f eV)', state_id + 1,
-                     (energy - origin).real * HARTREE2WAVENUMBER,
-                     (energy - origin).real * HARTREE2EV)
-            weights = abs(self.v[:, state_id]) ** 2
-            log.info('  Spin-free state composition:')
+            log.note(
+                'State %3d:  Delta E=%12.3f cm^-1 (%10.6f eV)  <S^2>=%6.3f',
+                state_id + 1,
+                (energy - origin).real * HARTREE2WAVENUMBER,
+                (energy - origin).real * HARTREE2EV,
+                self.s2[state_id],
+            )
             for state, state_slice in zip(self.states, self.state_slices):
-                probability = weights[state_slice].sum()
-                if probability > 0.01:
-                    log.info('    %5.1f%% from %s (S=%s)',
-                             probability * 100, state.label, state.spin)
+                amplitudes = self.v[state_slice, state_id]
+                for m_s, amplitude in zip(self._m_values(state.spin), amplitudes):
+                    if abs(amplitude) > 0.1:
+                        log.info(
+                            '    Spin-free state %3d:  S=%4.1f M_S=%5.1f '
+                            ' (%s)  %10.5f%+.5fj',
+                            state.spin_free_index,
+                            state.spin,
+                            m_s,
+                            state.label,
+                            amplitude.real,
+                            amplitude.imag,
+                        )
         return self
 
 
