@@ -20,7 +20,7 @@
 
 import cupy as cp
 import numpy as np
-from pyscf import ao2mo, lib
+from pyscf import ao2mo, gto, lib
 from gpu4pyscf import dft
 from gpu4pyscf.lib import logger
 from gpu4pyscf.lib.cupy_helper import add_sparse, contract, tag_array
@@ -1373,6 +1373,56 @@ def gen_vind_sfd(td):
     return vind, hdiag
 
 
+def as_scanner(td):
+    if isinstance(td, lib.SinglePointScanner):
+        return td
+
+    logger.info(td, 'Set %s as a scanner', td.__class__)
+    name = td.__class__.__name__ + NTTDA_Scanner.__name_mixin__
+    return lib.set_class(
+        NTTDA_Scanner(td),
+        (NTTDA_Scanner, td.__class__),
+        name,
+    )
+
+
+class NTTDA_Scanner(lib.SinglePointScanner):
+    device = 'gpu'
+
+    def __init__(self, td):
+        self.__dict__.update(td.__dict__)
+        self._scf = td._scf.as_scanner()
+        self._basis_fp = np.hstack(td.mol.bas_exps())
+
+    def __call__(self, mol_or_geom, **kwargs):
+        if isinstance(mol_or_geom, gto.MoleBase):
+            mol = mol_or_geom
+        else:
+            mol = self.mol.set_geom_(mol_or_geom, inplace=False)
+
+        previous_mol = self.mol
+        self.reset(mol)
+        mf_scanner = self._scf
+        previous_coeff = mf_scanner.mo_coeff
+        previous_occ = mf_scanner.mo_occ
+        mf_energy = mf_scanner(mol)
+
+        x0 = self.xy
+        if x0 is not None:
+            if np.array_equal(self._basis_fp, np.hstack(mol.bas_exps())):
+                x0 = self._transfer_initial_guess(
+                    x0,
+                    previous_mol,
+                    previous_coeff,
+                    previous_occ,
+                )
+            else:
+                x0 = self.xy = None
+
+        self.kernel(x0=x0, **kwargs)
+        return mf_energy + self.e
+
+
 class NTTDA(TDA):
     '''
     Noncollinear-Tensor TDA
@@ -1405,6 +1455,100 @@ class NTTDA(TDA):
         x0 = cp.zeros((n_init, hdiag.size))
         x0[cp.arange(n_init), idx] = 1.0
         return x0
+
+    def _transfer_initial_guess(self, xy, mol, mo_coeff, mo_occ):
+        mf = self._scf
+        overlap = cp.asarray(gto.intor_cross(
+            'int1e_ovlp', mf.mol, mol,
+        ))
+        old_coeff = cp.asarray(mo_coeff)
+        old_occ = cp.asarray(mo_occ)
+        new_coeff = cp.asarray(mf.mo_coeff)
+        new_occ = cp.asarray(mf.mo_occ)
+
+        def space_projection(occupation):
+            old = old_coeff[:, old_occ == occupation]
+            new = new_coeff[:, new_occ == occupation]
+            return new.T @ overlap @ old
+
+        closed = space_projection(2)
+        open_ = space_projection(1)
+        virtual = space_projection(0)
+        vectors = cp.stack([cp.asarray(x) for x, _ in xy])
+
+        def project(values, left, right):
+            projected = contract('ui,nij->nuj', left, values)
+            return contract('nuj,vj->nuv', projected, right)
+
+        if self.deltaS == 1:
+            return project(vectors, closed, virtual).reshape(
+                len(vectors), -1,
+            )
+        if self.deltaS == -1:
+            nclosed_new, nclosed_old = closed.shape
+            nopen_new, nopen_old = open_.shape
+            nvirtual_new, nvirtual_old = virtual.shape
+            holes = cp.zeros((
+                nclosed_new + nopen_new,
+                nclosed_old + nopen_old,
+            ))
+            holes[:nclosed_new, :nclosed_old] = closed
+            holes[nclosed_new:, nclosed_old:] = open_
+            particles = cp.zeros((
+                nopen_new + nvirtual_new,
+                nopen_old + nvirtual_old,
+            ))
+            particles[:nopen_new, :nopen_old] = open_
+            particles[nopen_new:, nopen_old:] = virtual
+            return project(vectors, holes, particles).reshape(
+                len(vectors), -1,
+            )
+        if self.deltaS == 0:
+            nclosed_old = closed.shape[1]
+            nopen_old = open_.shape[1]
+            nvirtual_old = virtual.shape[1]
+            old_slices = _sc_vector_slices(
+                nclosed_old,
+                nopen_old,
+                nvirtual_old,
+            )
+
+            def block(label, shape, left, right):
+                values = vectors[:, old_slices[label]].reshape(
+                    (len(vectors),) + shape,
+                )
+                return project(values, left, right).reshape(
+                    len(vectors), -1,
+                )
+
+            return cp.concatenate((
+                block(
+                    'CO(1)',
+                    (nclosed_old, nopen_old),
+                    closed,
+                    open_,
+                ),
+                block(
+                    'CV(1)',
+                    (nclosed_old, nvirtual_old),
+                    closed,
+                    virtual,
+                ),
+                vectors[:, old_slices['OO(1)']],
+                block(
+                    'OV(1)',
+                    (nopen_old, nvirtual_old),
+                    open_,
+                    virtual,
+                ),
+                block(
+                    'CV(0)',
+                    (nclosed_old, nvirtual_old),
+                    closed,
+                    virtual,
+                ),
+            ), axis=1)
+        raise ValueError('deltaS should be -1, 0, or 1')
 
     def kernel(self, x0=None, nstates=None):
         cpu0 = (logger.process_clock(), logger.perf_counter())
@@ -1445,6 +1589,8 @@ class NTTDA(TDA):
         x0sym = None
         if x0 is None:
             x0 = self.init_guess(hdiag)
+        elif len(x0) < nstates:
+            x0 = cp.vstack((x0, self.init_guess(hdiag, nstates)))
 
         self.converged, self.e, x1 = lr_eigh(
             vind,
@@ -1486,8 +1632,7 @@ class NTTDA(TDA):
     def analyze(self, *args, **kwargs):
         raise NotImplementedError('GPU NTTDA analysis is not implemented')
 
-    def as_scanner(self):
-        raise NotImplementedError('GPU NTTDA scanner is not implemented')
+    as_scanner = as_scanner
 
     def to_cpu(self):
         raise NotImplementedError('GPU NTTDA to_cpu is not implemented')

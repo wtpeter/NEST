@@ -15,6 +15,7 @@
 import subprocess
 import sys
 import unittest
+from unittest import mock
 
 import cupy as cp
 import numpy as np
@@ -200,6 +201,71 @@ class KnownValues(unittest.TestCase):
                 np.testing.assert_allclose(
                     actual, vectors @ matrix.T, atol=1e-8, rtol=0,
                 )
+
+    def test_gradient_scanner(self):
+        mol = self.mol.copy()
+        mol.verbose = 0
+        mf = mol.ROKS(xc='B3LYP').to_gpu().density_fit().run()
+        td = mf.NTTDA().set(deltaS=0, nstates=2).run()
+        scanner = td.Gradients().as_scanner(state=1)
+
+        coords = mol.atom_coords()
+        coords[0, 0] += 0.01
+        displaced = mol.set_geom_(
+            coords,
+            unit='Bohr',
+            inplace=False,
+        )
+        with mock.patch.object(
+                scanner.base,
+                'kernel',
+                wraps=scanner.base.kernel,
+        ) as kernel:
+            energy, gradient = scanner(displaced)
+
+        self.assertEqual(scanner.base.deltaS, 0)
+        self.assertEqual(scanner.base.nstates, 2)
+        self.assertTrue(scanner.converged)
+        self.assertEqual(gradient.shape, (mol.natm, 3))
+        self.assertIsNotNone(kernel.call_args.kwargs['x0'])
+        self.assertEqual(kernel.call_args.kwargs['x0'].shape[0], 2)
+        self.assertAlmostEqual(
+            energy,
+            scanner.base._scf.e_tot + scanner.base.e[0],
+            places=10,
+        )
+
+    def test_scanner_reuses_all_spin_channels(self):
+        mol = gto.M(
+            atom='O 0 0 0; O 0 0 1.2',
+            basis='sto-3g',
+            spin=2,
+            verbose=0,
+        )
+        displaced = mol.set_geom_(
+            'O 0 0 0; O 0 0 1.25',
+            inplace=False,
+        )
+        for delta_s in (-1, 0, 1):
+            mf = mol.ROKS(xc='HF').to_gpu().run()
+            td = mf.NTTDA().set(
+                deltaS=delta_s,
+                nstates=2,
+            ).run()
+            scanner = td.as_scanner()
+            with mock.patch.object(
+                    scanner,
+                    'kernel',
+                    wraps=scanner.kernel,
+            ) as kernel:
+                energies = scanner(displaced)
+
+            x0 = kernel.call_args.kwargs['x0']
+            self.assertIsNotNone(x0)
+            self.assertEqual(x0.shape[0], 2)
+            self.assertEqual(x0.shape[1], scanner.xy[0][0].size)
+            self.assertEqual(len(energies), 2)
+            self.assertTrue(bool(cp.all(scanner.converged)))
 
     def test_cpu_only_import(self):
         code = "import sys; import nest; assert 'cupy' not in sys.modules"
