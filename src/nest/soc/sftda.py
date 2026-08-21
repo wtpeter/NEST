@@ -13,7 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SOC driver for spin-flip TDA and TDDFT."""
+"""SOC driver for spin-flip TDA and TDDFT.
+Ref: J. Chem. Phys. 2022, 157, 224110.
+"""
 
 import numpy as np
 from pyscf import lib
@@ -74,7 +76,7 @@ class SOC(SOCBase):
                 energy=float(energy),
                 spin=spin,
                 amplitude=amplitude,
-                label=f'SF state {root + 1}',
+                label=f'state {root + 1}',
                 spin_square=s2,
             ))
         return states

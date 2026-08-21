@@ -83,8 +83,8 @@ soc_with_reference = tdm1.SOC(
 #         tds=[td0, tdm1], soctype="SOMF", include_reference=False,
 #     )
 #
-# Available soctype values are "SOMF", "Zeff", "1e", and "X2CAMF".  X2CAMF
-# requires the socutils package.
+# Available soctype values are "SOMF", "SOMF_AMFI", "Zeff", "1e", "X2C1E",
+# "X2CAMF", and "X2CMP".  X2CAMF and X2CMP require the optional socutils package.
 
 # 4. Print scalar states, SOC blocks, SOCCs, SOC energies, and compositions.
 print("\nSOC without the scalar reference")

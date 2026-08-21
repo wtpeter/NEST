@@ -13,7 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SOC driver framework for closed-shell RHF/RKS TDA and TDDFT."""
+"""
+SOC driver framework for closed-shell RHF/RKS TDA and TDDFT.
+Ref: J. Chem. Theory Comput. 2019, 15, 1896.
+"""
 
 import numpy as np
 from pyscf import lib
@@ -163,20 +166,16 @@ class SOC(SOCBase):
         gamma_mo = np.zeros((nmo, nmo))
 
         if abs(bra.spin) < 1e-12:
-            # A rank-one spin tensor cannot couple two singlets.
             pass
         elif abs(ket.spin) < 1e-12 and ket.source is None:
-            # <T_k||T_pq||0> = sum_ia delta_pa delta_qi t_ia^k.
             gamma_mo[np.ix_(viridx, occidx)] = bra.amplitude.T
         elif abs(ket.spin) < 1e-12:
-            # <T_k||T_pq||S_n>: virtual-virtual minus occupied-occupied.
             triplet = bra.amplitude
             singlet = ket.amplitude
             factor = 1.0 / np.sqrt(2.0)
             gamma_mo[np.ix_(viridx, viridx)] = factor * triplet.T @ singlet
             gamma_mo[np.ix_(occidx, occidx)] = -factor * singlet @ triplet.T
         else:
-            # <T_n||T_pq||T_k>; bra is n and ket is k in the note.
             bra_triplet = bra.amplitude
             ket_triplet = ket.amplitude
             gamma_mo[np.ix_(viridx, viridx)] = bra_triplet.T @ ket_triplet
