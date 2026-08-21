@@ -20,7 +20,8 @@
 
 from nest.soc.nttda import SOC as NTTDASOC
 from nest.soc.sftda import SOC as SFTDASOC
+from nest.soc.so_tddft import SOTDDFT
 from nest.soc.soc import SOCBase, SpinFreeState
 from nest.soc.tdrhf import SOC as TDRHFSOC
 
-__all__ = ['SOCBase', 'SpinFreeState', 'NTTDASOC', 'SFTDASOC', 'TDRHFSOC']
+__all__ = ['SOCBase', 'SpinFreeState', 'NTTDASOC', 'SFTDASOC', 'SOTDDFT', 'TDRHFSOC']
