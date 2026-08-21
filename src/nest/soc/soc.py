@@ -13,7 +13,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Common machinery for spin-orbit-coupled excited states."""
+"""Common machinery for spin-orbit-coupled excited states.
+
+The currently supported excited-state methods are:
+
+``TDRHFSOC``
+    Closed-shell RHF/RKS TDA and TDDFT, including singlets, triplets, and an
+    optional closed-shell reference state.
+``SFTDASOC``
+    Spin-flip TDA and spin-flip TDDFT.
+``NTTDASOC``
+    Noncollinear tensor TDA (NT-TDA).
+
+The supported, case-sensitive ``soctype`` keywords are:
+
+``1e``
+    Bare one-electron Breit--Pauli nuclear SOC.
+``Zeff``
+    One-electron SOC with ORCA-style effective nuclear charges.
+``SOMF``
+    The one-electron term plus the two-electron spin-orbit mean-field term.
+``SOMF_AMFI``
+    SOMF with only atomic mean-field contributions (AMFI).
+``X2C1E``
+    Spin-dependent part of PySCF's spinor X2C1e core Hamiltonian.
+``X2CAMF``
+    X2C atomic mean-field SOC from the optional ``socutils`` package.
+``X2CMP``
+    X2C molecular model-potential SOC from the optional ``socutils`` package.
+"""
 
 from dataclasses import dataclass
 from math import sqrt
@@ -78,7 +106,13 @@ def clebsch_gordan_rank1(j1, m1, q, j, m):
 
 
 class SOCBase(lib.StreamObject):
-    """Build and diagonalize a SOC Hamiltonian from scalar excited states."""
+    """Build and diagonalize a SOC Hamiltonian from scalar excited states.
+
+    The spin-projection blocks are reconstructed from reduced transition
+    densities with the Wigner--Eckart theorem.
+
+    Ref: J. Chem. Theory Comput. 2019, 15, 1896.
+    """
 
     _keys = {'states', 'soctype', 'soc_ao', 'state_slices', 'h_soc', 'e', 'v', 's2'}
 
@@ -256,8 +290,8 @@ class SOCBase(lib.StreamObject):
                 bra = self.states[bra_id]
                 ket = self.states[ket_id]
                 log.info(
-                    'SOC block: state %d (%s, S=%s) <- state %d (%s, S=%s); '
-                    'SOCC = %.6f cm^-1',
+                    'SOC block: <state %d (%s, S=%s) | H_SO | '
+                    'state %d (%s, S=%s)>; SOCC = %.6f cm^-1',
                     bra.spin_free_index, bra.label, bra.spin,
                     ket.spin_free_index, ket.label, ket.spin,
                     np.linalg.norm(block) * HARTREE2WAVENUMBER,
@@ -270,6 +304,10 @@ class SOCBase(lib.StreamObject):
         origin = self.e.min() if self.e.size else 0.0
         log.note('Spin-orbit-coupled eigenstates')
         self.spin_square()
+        log.info(
+            '%15s %5s %5s %-16s %10s %19s',
+            'Spin-free state', 'S', 'M_S', 'Label', 'Weight', 'Coefficient',
+        )
         for state_id, energy in enumerate(self.e):
             log.note(
                 'State %3d:  Delta E=%12.3f cm^-1 (%10.6f eV)  <S^2>=%6.3f',
@@ -283,14 +321,13 @@ class SOCBase(lib.StreamObject):
                 for m_s, amplitude in zip(self._m_values(state.spin), amplitudes):
                     if abs(amplitude) > 0.1:
                         log.info(
-                            '    Spin-free state %3d:  S=%4.1f M_S=%5.1f '
-                            ' (%s)  %10.5f%+.5fj',
+                            '%15d %5.1f %5.1f %-16s %10.5f %19s',
                             state.spin_free_index,
                             state.spin,
                             m_s,
                             state.label,
-                            amplitude.real,
-                            amplitude.imag,
+                            abs(amplitude) ** 2,
+                            f'{amplitude.real:.5f}{amplitude.imag:+.5f}j',
                         )
         return self
 
