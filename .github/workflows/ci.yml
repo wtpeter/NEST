@@ -24,7 +24,6 @@ jobs:
     timeout-minutes: 120
     env:
       OMP_NUM_THREADS: 2
-      PYTHONPATH: ${{ runner.temp }}
       SOCUTILS_REF: c1ebe464bde5060c3352038ad15e6ad3a9697c58
     steps:
       - uses: actions/checkout@v4
@@ -46,6 +45,7 @@ jobs:
           git -C "${RUNNER_TEMP}/socutils" fetch --depth=1 origin "${SOCUTILS_REF}"
           git -C "${RUNNER_TEMP}/socutils" checkout --detach FETCH_HEAD
           make -C "${RUNNER_TEMP}/socutils" CMAKE_ARGS=-DBLA_VENDOR=OpenBLAS
+          echo "PYTHONPATH=${RUNNER_TEMP}" >> "${GITHUB_ENV}"
       - name: Verify socutils SOC libraries
         run: |
           python -c "from socutils.lib import load_library; load_library('libx2camf_c')"
