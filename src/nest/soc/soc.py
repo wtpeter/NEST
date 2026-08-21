@@ -304,10 +304,15 @@ class SOCBase(lib.StreamObject):
         origin = self.e.min() if self.e.size else 0.0
         log.note('Spin-orbit-coupled eigenstates')
         self.spin_square()
-        log.info(
-            '%15s %5s %5s %-16s %10s %19s',
-            'Spin-free state', 'S', 'M_S', 'Label', 'Weight', 'Coefficient',
+        label_width = max(
+            len('Label'),
+            max((len(state.label) for state in self.states), default=0),
         )
+        header = (
+            f'{"Spin-free state":<15} {"S":>5} {"M_S":>6}   '
+            f'{"Label":^{label_width}}   {"Weight":>10}     Coefficient'
+        )
+        log.info('%s', header)
         for state_id, energy in enumerate(self.e):
             log.note(
                 'State %3d:  Delta E=%12.3f cm^-1 (%10.6f eV)  <S^2>=%6.3f',
@@ -320,15 +325,13 @@ class SOCBase(lib.StreamObject):
                 amplitudes = self.v[state_slice, state_id]
                 for m_s, amplitude in zip(self._m_values(state.spin), amplitudes):
                     if abs(amplitude) > 0.1:
-                        log.info(
-                            '%15d %5.1f %5.1f %-16s %10.5f %19s',
-                            state.spin_free_index,
-                            state.spin,
-                            m_s,
-                            state.label,
-                            abs(amplitude) ** 2,
-                            f'{amplitude.real:.5f}{amplitude.imag:+.5f}j',
+                        row = (
+                            f'{state.spin_free_index:>10d}{"":5} {state.spin:5.1f} '
+                            f'{m_s:6.1f}   {state.label:<{label_width}}   '
+                            f'{abs(amplitude) ** 2:10.5f}   '
+                            f'{amplitude.real:.5f}{amplitude.imag:+.5f}j'
                         )
+                        log.info('%s', row)
         return self
 
 
