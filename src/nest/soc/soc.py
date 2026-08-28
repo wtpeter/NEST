@@ -26,6 +26,8 @@ The currently supported excited-state methods are:
     Noncollinear tensor TDA (NT-TDA).
 ``SOTDDFT``
     Direct spin-orbit-coupled TDA for closed-shell RHF/RKS references.
+``SONTTDA``
+    Direct spin-orbit-coupled noncollinear-tensor TDA.
 
 The supported, case-sensitive ``soctype`` keywords are:
 
