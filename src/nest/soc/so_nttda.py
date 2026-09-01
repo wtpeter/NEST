@@ -103,17 +103,25 @@ class SONTTDA(NTTDA):
 
     @staticmethod
     def _apply_spin_free(vind, xs):
-        """Apply a real NTTDA response separately to real and imaginary parts."""
-        def apply_nonzero(real_xs):
-            result = np.zeros_like(real_xs)
-            active = np.any(real_xs != 0, axis=1)
-            if np.any(active):
-                result[active] = vind(real_xs[active])
+        """Apply a real NTTDA response to a batched real or complex input."""
+        components = (xs.real, xs.imag) if np.iscomplexobj(xs) else (xs,)
+        active = [np.any(component != 0, axis=1) for component in components]
+        packed = [component[mask] for component, mask in zip(components, active) if np.any(mask)]
+        result = np.zeros_like(xs)
+        if not packed:
             return result
 
-        if np.iscomplexobj(xs):
-            return apply_nonzero(xs.real) + 1j * apply_nonzero(xs.imag)
-        return apply_nonzero(xs)
+        values = vind(np.concatenate(packed, axis=0))
+        start = 0
+        for component_id, mask in enumerate(active):
+            count = np.count_nonzero(mask)
+            if count:
+                if component_id == 0:
+                    result.real[mask] = values[start:start + count]
+                else:
+                    result.imag[mask] = values[start:start + count]
+                start += count
+        return result
 
     @staticmethod
     def _split_delta0(xs, nc, no, nv):
@@ -565,10 +573,15 @@ class SONTTDA(NTTDA):
             outputs = np.zeros(inputs.shape, dtype=np.result_type(inputs, self.soc_mo))
             for delta_s in self._active_delta_s:
                 spin_vind = spin_free[delta_s][0]
-                for block_slice in self.block_slices[delta_s]:
-                    outputs[:, block_slice] += self._apply_spin_free(
-                        spin_vind, inputs[:, block_slice],
-                    )
+                slices = self.block_slices[delta_s]
+                branch_inputs = np.stack(
+                    [inputs[:, block_slice] for block_slice in slices], axis=1,
+                )
+                branch_outputs = self._apply_spin_free(
+                    spin_vind, branch_inputs.reshape(-1, dimensions[delta_s]),
+                ).reshape(len(inputs), len(slices), dimensions[delta_s])
+                for block_id, block_slice in enumerate(slices):
+                    outputs[:, block_slice] += branch_outputs[:, block_id]
                 self._apply_same_spin_soc(
                     delta_s, inputs, outputs, soc_blocks, nc, no, nv,
                 )

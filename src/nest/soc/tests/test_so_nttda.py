@@ -36,8 +36,11 @@ class KnownValues(unittest.TestCase):
         cls.neutral = gto.M(
             atom=atom, basis='sto-3g', charge=0, spin=2, symmetry=False, verbose=0,
         ).ROKS(xc='SVWN').run(conv_tol=1e-12)
-        cls.cation = gto.M(
+        cls.cation_doublet = gto.M(
             atom=atom, basis='sto-3g', charge=1, spin=1, symmetry=False, verbose=0,
+        ).ROKS(xc='SVWN').run(conv_tol=1e-12)
+        cls.cation_quartet = gto.M(
+            atom=atom, basis='sto-3g', charge=1, spin=3, symmetry=False, verbose=0,
         ).ROKS(xc='SVWN').run(conv_tol=1e-12)
 
     @staticmethod
@@ -68,6 +71,22 @@ class KnownValues(unittest.TestCase):
 
     def _full_space_oracle(self, mf, expected_delta_s):
         direct = SONTTDA(mf, soctype='1e').set(verbose=0)
+        spin_free_calls = dict.fromkeys(expected_delta_s, 0)
+        for delta_s, name in ((-1, 'gen_vind_sfd'), (0, 'gen_vind_sc'), (1, 'gen_vind_sfu')):
+            if delta_s not in expected_delta_s:
+                continue
+            generator = getattr(direct, name)
+
+            def counted_generator(generator=generator, delta_s=delta_s):
+                spin_vind, hdiag = generator()
+
+                def counted_vind(xs):
+                    spin_free_calls[delta_s] += 1
+                    return spin_vind(xs)
+
+                return counted_vind, hdiag
+
+            setattr(direct, name, counted_generator)
         if -1 in expected_delta_s:
             vind, hdiag = direct.gen_vind()
         else:
@@ -75,6 +94,7 @@ class KnownValues(unittest.TestCase):
                 vind, hdiag = direct.gen_vind()
         identity = np.eye(hdiag.size, dtype=np.complex128)
         h_direct = vind(identity).T
+        self.assertEqual(spin_free_calls, dict.fromkeys(expected_delta_s, 1))
         np.testing.assert_allclose(h_direct, h_direct.conj().T, atol=1e-12, rtol=0)
         self.assertEqual(direct._active_delta_s, expected_delta_s)
 
@@ -113,6 +133,20 @@ class KnownValues(unittest.TestCase):
             projected, state_interaction.h_soc, atol=1e-11, rtol=0,
         )
         return direct, projected
+
+    def test_complex_spin_free_batch_uses_one_call(self):
+        calls = []
+
+        def real_vind(xs):
+            calls.append(xs.copy())
+            return 2 * xs
+
+        xs = np.array([[1 + 2j, 0], [0, 3j], [0, 0]], dtype=np.complex128)
+        result = SONTTDA._apply_spin_free(real_vind, xs)
+        np.testing.assert_allclose(result, 2 * xs, atol=0, rtol=0)
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(np.iscomplexobj(calls[0]))
+        self.assertEqual(calls[0].shape, (3, 2))
 
     def test_neutral_full_space_and_kernel(self):
         subset = self.neutral.SONTTDA(deltaS=[-1, 0], soctype='1e')
@@ -165,8 +199,8 @@ class KnownValues(unittest.TestCase):
         ):
             self.assertIn(text, output)
 
-    def test_cation_skips_unphysical_deltam1(self):
-        direct, projected = self._full_space_oracle(self.cation, (0, 1))
+    def test_cation_doublet_skips_unphysical_deltam1(self):
+        direct, projected = self._full_space_oracle(self.cation_doublet, (0, 1))
         self.assertNotIn(-1, direct.block_slices)
         self.assertEqual(
             [direct.m_values[delta_s].tolist() for delta_s in (0, 1)],
@@ -185,6 +219,20 @@ class KnownValues(unittest.TestCase):
             atol=1e-8,
             rtol=0,
         )
+
+    def test_cation_quartet_full_space(self):
+        direct, projected = self._full_space_oracle(
+            self.cation_quartet, (-1, 0, 1),
+        )
+        self.assertEqual(
+            [direct.m_values[delta_s].tolist() for delta_s in (-1, 0, 1)],
+            [
+                [-0.5, 0.5],
+                [-1.5, -0.5, 0.5, 1.5],
+                [-2.5, -1.5, -0.5, 0.5, 1.5, 2.5],
+            ],
+        )
+        self.assertEqual(projected.shape, (406, 406))
 
 
 if __name__ == '__main__':
