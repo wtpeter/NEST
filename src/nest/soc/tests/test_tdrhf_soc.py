@@ -13,11 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import io
 import unittest
 
 import numpy as np
 from pyscf import gto
-from pyscf.data.nist import HARTREE2WAVENUMBER
+from pyscf.data.nist import HARTREE2EV, HARTREE2WAVENUMBER
+from pyscf.lib import logger
 
 from nest.soc import SOTDDFT, TDRHFSOC
 
@@ -112,6 +114,17 @@ class KnownValues(unittest.TestCase):
                 [1.009014435023905 - 2.9265773721032655j],
             ]),
             1e-5,
+        )
+
+        driver.stdout = io.StringIO()
+        self.assertIs(driver.analyze(verbose=logger.NOTE), driver)
+        output = driver.stdout.getvalue()
+        stabilization = driver.e.min().real - min(state.energy for state in driver.states)
+        self.assertIn(
+            'SOC stabilization of the ground state: '
+            f'{stabilization * HARTREE2WAVENUMBER: .4f} cm^-1 '
+            f'({stabilization * HARTREE2EV: .8f} eV)',
+            output,
         )
 
     def test_tda_somf_all_states_matches_direct(self):

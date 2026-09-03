@@ -306,6 +306,13 @@ class SOCBase(lib.StreamObject):
                     log.debug('%s', line)
 
         origin = self.e.min() if self.e.size else 0.0
+        spin_free_ground = min((state.energy for state in self.states), default=0.0)
+        stabilization = origin.real - spin_free_ground
+        log.note(
+            'SOC stabilization of the ground state: % .4f cm^-1 (% .8f eV)',
+            stabilization * HARTREE2WAVENUMBER,
+            stabilization * HARTREE2EV,
+        )
         log.note('Spin-orbit-coupled eigenstates')
         self.spin_square()
         label_width = max(
