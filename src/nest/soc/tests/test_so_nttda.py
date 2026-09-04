@@ -148,6 +148,24 @@ class KnownValues(unittest.TestCase):
         self.assertFalse(np.iscomplexobj(calls[0]))
         self.assertEqual(calls[0].shape, (3, 2))
 
+    def test_get_ab_matches_vectorized_vind(self):
+        rng = np.random.default_rng(13)
+        for channels, soctype in (((-1, 0, 1), 'SOMF'), ((-1, 0), '1e')):
+            direct = SONTTDA(
+                self.neutral, deltaS=channels, soctype=soctype,
+            ).set(verbose=0)
+            vind, _ = direct.gen_vind()
+            a = direct.get_ab()
+            xs = (
+                rng.standard_normal((a.shape[1], 10))
+                + 1j * rng.standard_normal((a.shape[1], 10))
+            )
+            np.testing.assert_allclose(
+                a @ xs, vind(xs.T).T, atol=1e-12, rtol=0,
+            )
+            np.testing.assert_allclose(a, a.conj().T, atol=1e-12, rtol=0)
+            self.assertEqual(direct._active_delta_s, channels)
+
     def test_neutral_full_space_and_kernel(self):
         subset = self.neutral.SONTTDA(deltaS=[-1, 0], soctype='1e')
         self.assertIsInstance(subset, SONTTDA)

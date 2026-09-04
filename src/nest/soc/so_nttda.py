@@ -30,7 +30,13 @@ from pyscf.data import nist
 from pyscf.lib import logger
 
 from nest._lr_eig import eigh as lr_eigh
-from nest.nttda.nttda import MO_BASE, NTTDA, _orbital_indices, _sc_vector_slices
+from nest.nttda.nttda import (
+    MO_BASE,
+    NTTDA,
+    _get_ab_matrices,
+    _orbital_indices,
+    _sc_vector_slices,
+)
 from nest.soc.soc import clebsch_gordan_rank1
 from nest.soc.soc_ao import get_ao_soc
 
@@ -507,12 +513,9 @@ class SONTTDA(NTTDA):
                 outputs[:, high_slice] += high_out
                 outputs[:, low_slice] += low_out
 
-    def gen_vind(self, mf=None):
-        """Generate the matrix-vector product for the direct SO-NTTDA matrix."""
-        if mf is None:
-            mf = self._scf
+    def _prepare_space(self, mf, caller):
         if mf is not self._scf:
-            raise ValueError('gen_vind must use the SCF object associated with SONTTDA')
+            raise ValueError(f'{caller} must use the SCF object associated with SONTTDA')
         self.check_sanity()
 
         csidx, osidx, vsidx = _orbital_indices(self)
@@ -525,18 +528,9 @@ class SONTTDA(NTTDA):
             0: nc * no + 2 * nc * nv + 1 + no * nv,
             1: nc * nv,
         }
-        spin_free = {}
-        for delta_s in self._active_delta_s:
-            if delta_s == -1:
-                spin_free[delta_s] = self.gen_vind_sfd()
-            elif delta_s == 0:
-                spin_free[delta_s] = self.gen_vind_sc()
-            else:
-                spin_free[delta_s] = self.gen_vind_sfu()
 
         self.block_slices = {}
         self.m_values = {}
-        hdiag_parts = []
         start = 0
         for delta_s in self._active_delta_s:
             spin = reference_spin + delta_s
@@ -548,7 +542,6 @@ class SONTTDA(NTTDA):
                 stop = start + dimensions[delta_s]
                 self.block_slices[delta_s].append(slice(start, stop))
                 start = stop
-                hdiag_parts.append(np.asarray(spin_free[delta_s][1]))
         self._physical_dimension = start - len(self.m_values.get(-1, ()))
 
         mo_coeff = np.asarray(mf.mo_coeff)
@@ -561,7 +554,28 @@ class SONTTDA(NTTDA):
         for row_name, rows in indices.items():
             for col_name, cols in indices.items():
                 soc_blocks[row_name + col_name] = self.soc_mo[:, rows[:, None], cols]
-        dimension = start
+        return nc, no, nv, dimensions, soc_blocks, start
+
+    def gen_vind(self, mf=None):
+        """Generate the matrix-vector product for the direct SO-NTTDA matrix."""
+        if mf is None:
+            mf = self._scf
+        nc, no, nv, dimensions, soc_blocks, dimension = self._prepare_space(
+            mf, 'gen_vind',
+        )
+        spin_free = {}
+        for delta_s in self._active_delta_s:
+            if delta_s == -1:
+                spin_free[delta_s] = self.gen_vind_sfd()
+            elif delta_s == 0:
+                spin_free[delta_s] = self.gen_vind_sc()
+            else:
+                spin_free[delta_s] = self.gen_vind_sfu()
+
+        hdiag_parts = []
+        for delta_s in self._active_delta_s:
+            for _ in self.m_values[delta_s]:
+                hdiag_parts.append(np.asarray(spin_free[delta_s][1]))
 
         def vind(zs):
             zs = np.asarray(zs)
@@ -597,6 +611,57 @@ class SONTTDA(NTTDA):
 
         hdiag = np.concatenate(hdiag_parts).astype(np.complex128)
         return vind, hdiag
+
+    def get_ab(self, mf=None):
+        """Return the projected SO-NTTDA A matrix in the ``gen_vind`` basis."""
+        if mf is None:
+            mf = self._scf
+        nc, no, nv, _, soc_blocks, dimension = self._prepare_space(
+            mf, 'get_ab',
+        )
+
+        matrix = np.zeros(
+            (dimension, dimension), dtype=np.complex128, order='F',
+        )
+        spin_free_matrices = _get_ab_matrices(self, self._active_delta_s, mf)
+        for delta_s in self._active_delta_s:
+            for block_slice in self.block_slices[delta_s]:
+                matrix[block_slice, block_slice] = spin_free_matrices[delta_s]
+
+        # The SOC routines consume trial vectors by row.  Apply columns of the
+        # identity in small batches; a full identity and output would each be
+        # as large as the final dense Hamiltonian.
+        batch_size = 128
+        for start in range(0, dimension, batch_size):
+            stop = min(start + batch_size, dimension)
+            inputs = np.zeros((stop - start, dimension), dtype=np.complex128)
+            inputs[np.arange(stop - start), np.arange(start, stop)] = 1.0
+            outputs = np.zeros_like(inputs)
+            for delta_s in self._active_delta_s:
+                self._apply_same_spin_soc(
+                    delta_s, inputs, outputs, soc_blocks, nc, no, nv,
+                )
+            for higher_delta in (0, 1):
+                if (
+                    higher_delta in self._active_delta_s
+                    and higher_delta - 1 in self._active_delta_s
+                ):
+                    self._apply_cross_spin_soc(
+                        higher_delta, inputs, outputs, soc_blocks, nc, no, nv,
+                    )
+            matrix[:, start:stop] += outputs.T
+
+        # deltaS=-1 contains one redundant trace direction per M_S block.
+        # gen_vind applies this orthogonal projector to both input and output,
+        # so the explicit operator is P A P and works for arbitrary raw input.
+        if -1 in self._active_delta_s:
+            width = no + nv
+            local_trace = (nc + np.arange(no)) * width + np.arange(no)
+            for block_slice in self.block_slices[-1]:
+                trace = block_slice.start + local_trace
+                matrix[:, trace] -= matrix[:, trace].sum(axis=1)[:, None] / no
+                matrix[trace] -= matrix[trace].sum(axis=0)[None] / no
+        return matrix
 
     def get_init_guess(self, hdiag, nstates=None):
         """Build guesses spanning only the physical, trace-free -1 space."""

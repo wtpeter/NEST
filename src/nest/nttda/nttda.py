@@ -19,6 +19,7 @@
 #
 
 import numpy as np
+from pyscf import ao2mo
 from pyscf import lib
 from pyscf import dft
 from pyscf.lib import logger
@@ -426,6 +427,423 @@ def gen_rohf_response_sfd(mf, mo_coeff=None, mo_occ=None, hermi=0, max_memory=No
         if omega != 0:
             delta -= mf.get_k(mol, dmoo, 1, omega=omega) * (alpha - hyb)
     return vind, 0.5 * delta
+
+
+def _get_fock0_fockz(td, response_function):
+    mf = td._scf
+    _, fockz = response_function(
+        mf, mo_coeff=mf.mo_coeff, mo_occ=mf.mo_occ, hermi=0,
+        max_memory=td.max_memory, log=logger.new_logger(td),
+    )
+    if td.nobeta:
+        dma, dmb = mf.make_rdm1()
+        dm0 = 0.5 * (dma + dmb)
+        fock = mf.get_fock(dm=np.array([dm0, dm0]))
+    else:
+        fock = mf.get_fock()
+    return 0.5 * (fock.focka + fock.fockb), fockz
+
+
+def _transform_reference_integrals(mf, omega=None):
+    mol = mf.mol
+    if omega is None:
+        eri_ao = mol.intor('int2e_sph', aosym='s8')
+        eri_mo = ao2mo.incore.full(eri_ao, mf.mo_coeff, compact=False)
+    else:
+        with mol.with_range_coulomb(omega):
+            eri_ao = mol.intor('int2e_sph', aosym='s8')
+            eri_mo = ao2mo.incore.full(eri_ao, mf.mo_coeff, compact=False)
+    nmo = mf.mo_coeff.shape[1]
+    return eri_mo.reshape(nmo, nmo, nmo, nmo)
+
+
+def _pair_indices(holes, particles):
+    return np.repeat(holes, len(particles)), np.tile(particles, len(holes))
+
+
+def _kernel_layout(ndim, blocks):
+    holes = np.zeros(ndim, dtype=np.int32)
+    particles = np.zeros(ndim, dtype=np.int32)
+    for block_slice, block_holes, block_particles in blocks:
+        if block_holes is None:
+            continue
+        holes[block_slice], particles[block_slice] = _pair_indices(
+            block_holes, block_particles,
+        )
+    return holes, particles
+
+
+def _reference_kernels_from_eri(eri_mo, holes, particles):
+    row_holes = holes[:, None]
+    row_particles = particles[:, None]
+    column_holes = holes[None, :]
+    column_particles = particles[None, :]
+    return (
+        -eri_mo[row_particles, column_particles, column_holes, row_holes],
+        -eri_mo[row_particles, row_holes, column_particles, column_holes],
+    )
+
+
+def _project_reference_potential(potential, mo, holes, particles):
+    transformed = lib.einsum('xpq,py->xyq', potential, mo[:, particles])
+    return lib.einsum('xyq,qy->xy', transformed, mo[:, holes]).T
+
+
+def _reference_kernels_from_xc(td, holes, particles):
+    mf = td._scf
+    ni = mf._numint
+    mol = mf.mol
+    mo = np.asarray(mf.mo_coeff)
+    dms = lib.einsum('px,qx->xpq', mo[:, particles], mo[:, holes])
+    fxc = ni.cache_xc_kernel(
+        mol, mf.grids, mf.xc, mf.mo_coeff, mf.mo_occ, 1,
+    )[2]
+    fxc_ref = 0.5 * (
+        fxc[0, :, 0] - fxc[0, :, 1]
+        - fxc[1, :, 0] + fxc[1, :, 1]
+    )
+    vref0 = ni.nr_rks_fxc(
+        mol, mf.grids, mf.xc, None, dms, 0, 0,
+        None, None, fxc_ref, max_memory=td.max_memory,
+    )
+    xctype = ni._xc_type(mf.xc)
+    if xctype == 'LDA':
+        vref1 = vref0
+    elif xctype == 'GGA':
+        vref1 = nr_rks_fxc1_gga(
+            ni, mol, mf.grids, mf.xc, dms, fxc_ref,
+            max_memory=td.max_memory,
+        )
+    elif xctype == 'MGGA':
+        vref1 = nr_rks_fxc1_mgga(
+            ni, mol, mf.grids, mf.xc, dms, fxc_ref,
+            max_memory=td.max_memory,
+        )
+    else:
+        raise NotImplementedError(
+            'NTTDA get_ab XC kernel for %s is not implemented' % xctype,
+        )
+    return (
+        _project_reference_potential(vref0, mo, holes, particles),
+        _project_reference_potential(vref1, mo, holes, particles),
+    )
+
+
+def _reference_kernels(td, eri_mo, holes, particles):
+    mf = td._scf
+    xctype = mf._numint._xc_type(mf.xc)
+    if xctype == 'HF':
+        return _reference_kernels_from_eri(eri_mo, holes, particles)
+    if xctype in ('LDA', 'GGA', 'MGGA'):
+        k0, k1 = _reference_kernels_from_xc(td, holes, particles)
+        omega, alpha, hybrid = mf._numint.rsh_and_hybrid_coeff(
+            mf.xc, mf.mol.spin,
+        )
+        if hybrid:
+            exchange, coulomb = _reference_kernels_from_eri(
+                eri_mo, holes, particles,
+            )
+            k0 += hybrid * exchange
+            k1 += hybrid * coulomb
+        if omega != 0:
+            exchange, coulomb = _reference_kernels_from_eri(
+                _transform_reference_integrals(mf, omega=omega), holes, particles,
+            )
+            k0 += (alpha - hybrid) * exchange
+            k1 += (alpha - hybrid) * coulomb
+        return k0, k1
+    raise NotImplementedError(
+        'NTTDA get_ab reference kernel for %s is not implemented' % xctype,
+    )
+
+
+def _set_symmetric_block(matrix, slices, row, column, block):
+    row_slice = slices[row]
+    column_slice = slices[column]
+    matrix[row_slice, column_slice] = block
+    if row != column:
+        matrix[column_slice, row_slice] = block.T
+
+
+def _set_symmetric_coefficient(matrix, slices, row, column, value):
+    row_slice = slices[row]
+    column_slice = slices[column]
+    matrix[row_slice, column_slice] = value
+    if row != column:
+        matrix[column_slice, row_slice] = value
+
+
+def _one_body_block(particle_fock, hole_fock):
+    nhole = hole_fock.shape[0]
+    nparticle = particle_fock.shape[0]
+    dtype = np.result_type(particle_fock, hole_fock)
+    return (
+        np.kron(np.eye(nhole, dtype=dtype), particle_fock)
+        - np.kron(hole_fock.T, np.eye(nparticle, dtype=dtype))
+    )
+
+
+def _add_reference_kernel(matrix, td, eri_mo, holes, particles, slices, coefficients):
+    k0, k1 = _reference_kernels(td, eri_mo, holes, particles)
+    c0 = np.zeros_like(matrix)
+    c1 = np.zeros_like(matrix)
+    for row, column, weight0, weight1 in coefficients:
+        if weight0:
+            _set_symmetric_coefficient(c0, slices, row, column, weight0)
+        if weight1:
+            _set_symmetric_coefficient(c1, slices, row, column, weight1)
+    matrix += c0 * k0 + c1 * k1
+
+
+def _get_ab_sfu(td, eri_mo):
+    mf = td._scf
+    csidx, _, vsidx = _orbital_indices(td)
+    c = mf.mo_coeff[:, csidx]
+    v = mf.mo_coeff[:, vsidx]
+    nc, nv = c.shape[1], v.shape[1]
+    ndim = nc * nv
+    slices = {'CV': slice(0, ndim)}
+
+    fock0, fockz = _get_fock0_fockz(td, gen_rohf_response_sfu)
+    matrix = _one_body_block(
+        v.T @ (fock0 + fockz) @ v,
+        c.T @ (fock0 - fockz) @ c,
+    )
+    holes, particles = _kernel_layout(
+        ndim, ((slices['CV'], csidx, vsidx),),
+    )
+    _add_reference_kernel(
+        matrix, td, eri_mo, holes, particles, slices,
+        (('CV', 'CV', 1.0, 0.0),),
+    )
+    return matrix
+
+
+def _get_ab_sfd(td, eri_mo):
+    mf = td._scf
+    csidx, osidx, vsidx = _orbital_indices(td)
+    c = mf.mo_coeff[:, csidx]
+    o = mf.mo_coeff[:, osidx]
+    v = mf.mo_coeff[:, vsidx]
+    nc, no, nv = c.shape[1], o.shape[1], v.shape[1]
+    spin = 0.5 * no
+    denominator = 2.0 * spin - 1.0
+
+    nco, ncv, noo, nov = nc * no, nc * nv, no * no, no * nv
+    slices = {
+        'CO': slice(0, nco),
+        'CV': slice(nco, nco + ncv),
+        'OO': slice(nco + ncv, nco + ncv + noo),
+        'OV': slice(nco + ncv + noo, nco + ncv + noo + nov),
+    }
+    ndim = slices['OV'].stop
+    matrix = np.zeros((ndim, ndim))
+
+    fock0, fockz = _get_fock0_fockz(td, gen_rohf_response_sfd)
+    fminus = fock0 - fockz
+    fplus = fock0 + fockz
+    fminus_oo = o.T @ fminus @ o
+    fplus_cc = c.T @ fplus @ c
+    fz_cc = c.T @ fockz @ c
+    fminus_vv = v.T @ fminus @ v
+    fz_vv = v.T @ fockz @ v
+    fplus_oo = o.T @ fplus @ o
+
+    _set_symmetric_block(matrix, slices, 'CO', 'CO', _one_body_block(
+        fminus_oo, fplus_cc + 2.0 / denominator * fz_cc,
+    ))
+    _set_symmetric_block(matrix, slices, 'CV', 'CV', _one_body_block(
+        fminus_vv - fz_vv / spin, fplus_cc + fz_cc / spin,
+    ))
+    _set_symmetric_block(
+        matrix, slices, 'OO', 'OO', _one_body_block(fminus_oo, fplus_oo),
+    )
+    _set_symmetric_block(matrix, slices, 'OV', 'OV', _one_body_block(
+        fminus_vv - 2.0 / denominator * fz_vv, fplus_oo,
+    ))
+
+    a = np.sqrt((2.0 * spin + 1.0) / (2.0 * spin))
+    b = np.sqrt(2.0 * spin / denominator)
+    ccoef = np.sqrt((2.0 * spin + 1.0) / denominator)
+    d = 1.0 / np.sqrt(2.0 * spin * denominator)
+    _set_symmetric_block(
+        matrix, slices, 'CV', 'CO',
+        a * np.kron(np.eye(nc), v.T @ fminus @ o),
+    )
+    _set_symmetric_block(
+        matrix, slices, 'CV', 'OV',
+        -a * np.kron((o.T @ fplus @ c).T, np.eye(nv)),
+    )
+
+    block = np.zeros((noo, nco))
+    block4 = block.reshape(no, no, nc, no)
+    diagonal = np.arange(no)
+    fplus_co = c.T @ fplus @ o
+    fminus_co = c.T @ fminus @ o
+    for u in range(no):
+        block4[u] -= b * np.eye(no)[:, None, :] * fplus_co[:, u][None, :, None]
+    block4[diagonal, diagonal] += d * fminus_co[None]
+    _set_symmetric_block(matrix, slices, 'OO', 'CO', block)
+
+    block = np.zeros((noo, ncv))
+    block.reshape(no, no, nc, nv)[diagonal, diagonal] = (
+        -ccoef / spin * (c.T @ fockz @ v)[None]
+    )
+    _set_symmetric_block(matrix, slices, 'OO', 'CV', block)
+
+    block = np.zeros((noo, nov))
+    block4 = block.reshape(no, no, no, nv)
+    fminus_ov = o.T @ fminus @ v
+    fplus_ov = o.T @ fplus @ v
+    for u in range(no):
+        block4[u, :, u, :] += b * fminus_ov
+    block4[diagonal, diagonal] -= d * fplus_ov[None]
+    _set_symmetric_block(matrix, slices, 'OO', 'OV', block)
+
+    holes, particles = _kernel_layout(ndim, (
+        (slices['CO'], csidx, osidx),
+        (slices['CV'], csidx, vsidx),
+        (slices['OO'], osidx, osidx),
+        (slices['OV'], osidx, vsidx),
+    ))
+    _add_reference_kernel(matrix, td, eri_mo, holes, particles, slices, (
+        ('CO', 'CO', 1.0, 1.0 / denominator),
+        ('CV', 'CV', 1.0, 0.0),
+        ('OO', 'OO', 1.0, 0.0),
+        ('OV', 'OV', 1.0, 1.0 / denominator),
+        ('CV', 'CO', a, 0.0),
+        ('CV', 'OV', a, 0.0),
+        ('OO', 'CO', b, 0.0),
+        ('OO', 'CV', ccoef, 0.0),
+        ('OO', 'OV', b, 0.0),
+        ('CO', 'OV', 2.0 * spin / denominator, -1.0 / denominator),
+    ))
+
+    native_to_block = np.concatenate((
+        np.concatenate((
+            np.arange(nco).reshape(nc, no),
+            np.arange(ncv).reshape(nc, nv) + nco,
+        ), axis=1).ravel(),
+        np.concatenate((
+            np.arange(noo).reshape(no, no) + nco + ncv,
+            np.arange(nov).reshape(no, nv) + nco + ncv + noo,
+        ), axis=1).ravel(),
+    ))
+    return matrix[np.ix_(native_to_block, native_to_block)]
+
+
+def _get_ab_sc(td, eri_mo):
+    mf = td._scf
+    csidx, osidx, vsidx = _orbital_indices(td)
+    c = mf.mo_coeff[:, csidx]
+    o = mf.mo_coeff[:, osidx]
+    v = mf.mo_coeff[:, vsidx]
+    nc, no, nv = c.shape[1], o.shape[1], v.shape[1]
+    spin = 0.5 * no
+    native_slices = _sc_vector_slices(nc, no, nv)
+    slices = {
+        'CO': native_slices['CO(1)'],
+        'CV': native_slices['CV(1)'],
+        'OO': native_slices['OO(1)'],
+        'OV': native_slices['OV(1)'],
+        'CV0': native_slices['CV(0)'],
+    }
+    ndim = slices['CV0'].stop
+    matrix = np.zeros((ndim, ndim))
+
+    fock0, fockz = _get_fock0_fockz(td, gen_rohf_response_sc)
+    fminus = fock0 - fockz
+    fplus = fock0 + fockz
+    f0_vv = v.T @ fock0 @ v
+    f0_cc = c.T @ fock0 @ c
+    fz_vv = v.T @ fockz @ v
+    fz_cc = c.T @ fockz @ c
+
+    _set_symmetric_block(
+        matrix, slices, 'CV0', 'CV0', _one_body_block(f0_vv, f0_cc),
+    )
+    _set_symmetric_block(matrix, slices, 'CV', 'CV', _one_body_block(
+        f0_vv - fz_vv / spin, f0_cc + fz_cc / spin,
+    ))
+    _set_symmetric_block(matrix, slices, 'CO', 'CO', _one_body_block(
+        o.T @ fminus @ o, c.T @ fminus @ c,
+    ))
+    _set_symmetric_block(matrix, slices, 'OV', 'OV', _one_body_block(
+        v.T @ fplus @ v, o.T @ fplus @ o,
+    ))
+
+    a = np.sqrt((spin + 1.0) / (2.0 * spin))
+    d = np.sqrt((spin + 1.0) / spin)
+    h = np.sqrt(0.5)
+    r2 = np.sqrt(2.0)
+    _set_symmetric_block(matrix, slices, 'CV0', 'CV',
+                         -d * np.kron(np.eye(nc), fz_vv)
+                         + d * np.kron(fz_cc.T, np.eye(nv)))
+    _set_symmetric_block(matrix, slices, 'CV0', 'CO',
+                         h * np.kron(np.eye(nc), v.T @ fminus @ o))
+    _set_symmetric_block(matrix, slices, 'CV0', 'OV',
+                         h * np.kron((o.T @ fplus @ c).T, np.eye(nv)))
+    _set_symmetric_block(matrix, slices, 'CV', 'CO',
+                         a * np.kron(np.eye(nc), v.T @ fminus @ o))
+    _set_symmetric_block(matrix, slices, 'CV', 'OV',
+                         -a * np.kron((o.T @ fplus @ c).T, np.eye(nv)))
+    _set_symmetric_block(matrix, slices, 'OO', 'CV0',
+                         (-r2 * (c.T @ fock0 @ v)).reshape(1, -1))
+    _set_symmetric_block(matrix, slices, 'OO', 'CV',
+                         (2.0 * a * (c.T @ fockz @ v)).reshape(1, -1))
+    _set_symmetric_block(matrix, slices, 'OO', 'CO',
+                         (-(c.T @ fminus @ o)).reshape(1, -1))
+    _set_symmetric_block(matrix, slices, 'OO', 'OV',
+                         (o.T @ fplus @ v).reshape(1, -1))
+
+    holes, particles = _kernel_layout(ndim, (
+        (slices['CO'], csidx, osidx),
+        (slices['CV'], csidx, vsidx),
+        (slices['OO'], None, None),
+        (slices['OV'], osidx, vsidx),
+        (slices['CV0'], csidx, vsidx),
+    ))
+    _add_reference_kernel(matrix, td, eri_mo, holes, particles, slices, (
+        ('CO', 'CO', 1.0, -1.0),
+        ('CV', 'CV', 1.0, 0.0),
+        ('OV', 'OV', 1.0, -1.0),
+        ('CV0', 'CV0', 1.0, -2.0),
+        ('CV', 'CO', a, 0.0),
+        ('CV', 'OV', a, 0.0),
+        ('CV0', 'CO', h, -r2),
+        ('CV0', 'OV', -h, r2),
+        ('CO', 'OV', 0.0, 1.0),
+    ))
+    return matrix
+
+
+def _get_ab_matrices(td, delta_s_values, mf=None):
+    if mf is None:
+        mf = td._scf
+    if mf is not td._scf:
+        raise ValueError('NTTDA get_ab requires td._scf')
+    if getattr(mf, 'with_df', None):
+        raise NotImplementedError('NTTDA get_ab does not support density fitting')
+    xctype = mf._numint._xc_type(mf.xc)
+    if xctype not in ('HF', 'LDA', 'GGA', 'MGGA'):
+        raise NotImplementedError(
+            'NTTDA get_ab does not support XC type %s' % xctype,
+        )
+    hybrid = mf._numint.libxc.is_hybrid_xc(mf.xc)
+    eri_mo = _transform_reference_integrals(mf) if xctype == 'HF' or hybrid else None
+    builders = {-1: _get_ab_sfd, 0: _get_ab_sc, 1: _get_ab_sfu}
+    invalid = [delta_s for delta_s in delta_s_values if delta_s not in builders]
+    if invalid:
+        raise ValueError('deltaS should be -1, 0, or 1')
+    return {
+        delta_s: builders[delta_s](td, eri_mo)
+        for delta_s in delta_s_values
+    }
+
+
+def get_ab(td, mf=None):
+    """Build the explicit NTTDA A matrix in the native ``vind`` ordering."""
+    return _get_ab_matrices(td, (td.deltaS,), mf)[td.deltaS]
 
 
 def gen_vind_sfu(td):
@@ -849,6 +1267,9 @@ class NTTDA(TDBase):
     gen_vind_sfu = gen_vind_sfu
     gen_vind_sc = gen_vind_sc
     gen_vind_sfd = gen_vind_sfd
+
+    def get_ab(self, mf=None):
+        return get_ab(self, mf)
 
     def SOC(self, *others, soctype="SOMF", include_reference=False):
         from nest.soc import nttda as nttda_soc
