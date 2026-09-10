@@ -772,6 +772,12 @@ class NTTDA(TDBase):
 
     Gradients = nuc_grad_method
 
+    def Hessian(self):
+        """Return the dense analytic HF NTTDA nuclear-Hessian driver."""
+        from nest.hessian.nttda import Hessian
+
+        return Hessian(self)
+
     def init_guess(self, hdiag, nstates=None):
         if nstates is None:
             nstates = self.nstates
