@@ -15,7 +15,9 @@
 from types import SimpleNamespace
 import unittest
 
+import numpy as np
 from pyscf import gto, lib
+from pyscf.data.nist import LIGHT_SPEED
 from nest.soc import soc_ao
 
 
@@ -29,6 +31,56 @@ else:
 
 def fp(mat):
     return lib.fp(mat)
+
+
+class NuclearModels(unittest.TestCase):
+    def test_bp1e_gaussian_analytic_and_point_limit(self):
+        # Normalized px, py, pz primitives with exponent alpha=1.
+        mol = gto.M(atom='He 0 0 0', basis={'He': [[1, [1.0, 1.0]]]},
+                    verbose=0)
+        point = 4 * 2**1.5 / (3 * np.sqrt(np.pi))
+        # The returned q=0 component is the Cartesian z component / sqrt(2).
+        scale = -1j * 2 / (2 * LIGHT_SPEED**2 * np.sqrt(2))
+        for zeta in (0, 1, 100, 1e8, 1e16):
+            with self.subTest(zeta=zeta):
+                mol.set_nuc_mod(0, zeta)
+                ratio = (zeta / (zeta + 2))**1.5 if zeta else 1
+                actual = soc_ao.get_ao_soc_1e(mol)[1, 0, 1]
+                np.testing.assert_allclose(actual, scale * point * ratio,
+                                           rtol=1e-12, atol=1e-16)
+
+    def test_bp1e_nuclear_models_and_context(self):
+        for model in (None, gto.dyall_nuc_mod, gto.filatov_nuc_mod,
+                      {'O': gto.filatov_nuc_mod}):
+            with self.subTest(model=model):
+                mol = gto.M(atom='O 0 0 0; H 0 0 1; H 0 1 0',
+                            basis='cc-pvdz', nucmod=model, verbose=0)
+                expected = soc_ao._cartesian_to_spherical(
+                    1j * mol.intor('int1e_pnucxp') / (2 * LIGHT_SPEED**2))
+                mol.set_rinv_orig((1, 2, 3))
+                mol.set_rinv_zeta(0.75)
+                before = mol._env.copy()
+                actual = soc_ao.get_ao_soc_1e(mol)
+                np.testing.assert_allclose(actual, expected, rtol=1e-11, atol=1e-14)
+                np.testing.assert_array_equal(
+                    mol._env[gto.PTR_RINV_ORIG:gto.PTR_RINV_ORIG+3],
+                    before[gto.PTR_RINV_ORIG:gto.PTR_RINV_ORIG+3])
+                self.assertEqual(mol._env[gto.PTR_RINV_ZETA],
+                                 before[gto.PTR_RINV_ZETA])
+
+    def test_x2c1e_nuclear_models_and_point_limit(self):
+        mol = gto.M(atom='Ne 0 0 0', basis='cc-pvdz', verbose=0)
+        point = soc_ao.get_ao_soc_x2c1e(mol)
+        for model in (gto.dyall_nuc_mod, gto.filatov_nuc_mod):
+            with self.subTest(model=model.__name__):
+                finite = gto.M(atom='Ne 0 0 0', basis='cc-pvdz',
+                               nucmod=model, verbose=0)
+                actual = soc_ao.get_ao_soc_x2c1e(finite)
+                self.assertGreater(np.linalg.norm(actual-point) / np.linalg.norm(point),
+                                   1e-8)
+                finite.set_nuc_mod(0, 1e16)
+                np.testing.assert_allclose(soc_ao.get_ao_soc_x2c1e(finite),
+                                           point, rtol=1e-7, atol=1e-10)
 
 
 class KnownValues(unittest.TestCase):

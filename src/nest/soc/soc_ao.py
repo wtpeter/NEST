@@ -179,12 +179,15 @@ def sozeff(atom, zeff_type="one"):
             raise ValueError(f"SOZEFF is not available for atomic number {atom}")
 
 def get_ao_soc_1e(mol, zeff_type='one'):
-    """The one-body part of Hsoc operator with (effective) nuclear charge."""
+    """The one-body SOC with (effective) charge and the built nuclear model."""
     zeff_list = [sozeff(mol.atom_charge(i), zeff_type=zeff_type) for i in range(mol.natm)]
     ao_soc = np.zeros((3, mol.nao_nr(), mol.nao_nr()), dtype=np.complex128)
-    for k in range(mol.natm):
-        mol.set_rinv_orig(mol.atom_coord(k))
-        ao_soc += (-1.0j) * zeff_list[k] * mol.intor('int1e_prinvxp')
+    # The point-nucleus context only sets the origin, so clear any external
+    # rinv exponent first.  Finite nuclei then supply their own exponents.
+    with mol.with_rinv_zeta(0):
+        for k in range(mol.natm):
+            with mol.with_rinv_at_nucleus(k):
+                ao_soc += (-1.0j) * zeff_list[k] * mol.intor('int1e_prinvxp')
     ao_soc /= (2.0 * LIGHT_SPEED**2)
     return _cartesian_to_spherical(ao_soc)
 
