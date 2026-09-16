@@ -4,7 +4,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from pyscf import dft, lib
+from pyscf import dft
+from scipy.sparse.linalg import LinearOperator, gmres
 
 
 
@@ -209,28 +210,31 @@ def _preconditioner(tdobj, pairs):
 
 
 def solve_zvector(action, pairs, tdobj, rhs, tolerance=1e-12, max_cycle=None):
-    """Solve ``H.T z = rhs`` using the PySCF CPHF Krylov pattern."""
+    """Solve ``H.T z = rhs`` and check the unpreconditioned residual.
+
+    A small new Krylov basis vector does not imply a small equation residual.
+    Restarted GMRES uses the latter criterion, avoiding silent early termination
+    of the previous unnormalized Krylov expansion on larger orbital spaces.
+    """
+    if len(rhs) == 0 or np.linalg.norm(rhs) <= tolerance:
+        return np.zeros_like(rhs)
     diagonal = _preconditioner(tdobj, pairs)
-    initial = rhs / diagonal
     if max_cycle is None:
         max_cycle = len(rhs)
-
-    def operator(vector):
-        vector = np.asarray(vector)
-        if vector.ndim == 1:
-            return action(vector) / diagonal - vector
-        return np.asarray([action(row) / diagonal - row for row in vector])
-
-    solution = lib.krylov(
-        operator,
-        initial,
-        tol=tolerance,
-        max_cycle=max_cycle,
-        lindep=1e-22,
-        hermi=False,
-        verbose=0,
+    shape = (len(rhs), len(rhs))
+    operator = LinearOperator(shape, matvec=action, dtype=float)
+    preconditioner = LinearOperator(shape, matvec=lambda v: v / diagonal, dtype=float)
+    solution, info = gmres(
+        operator, rhs, M=preconditioner, atol=tolerance, rtol=0,
+        restart=min(40, len(rhs)), maxiter=max_cycle,
+        # Preserve cphf_max_cycle as a limit on inner iterations, not restarts.
+        callback=lambda _: None, callback_type='legacy',
     )
-    return np.asarray(solution).reshape(-1)
+    residual = float(np.linalg.norm(action(solution) - rhs))
+    if info != 0 or not np.isfinite(residual) or residual > tolerance:
+        raise RuntimeError('NTTDA gradient Z-vector GMRES failed: info=%d, residual=%.3g, tolerance=%.3g'
+                           % (info, residual, tolerance))
+    return solution
 
 
 def _unpack_zvector_source(tdobj, pairs, zvector):

@@ -86,12 +86,14 @@ class Gradients(rhf_grad.GradientsBase):
             atmlst = list(atmlst)
         return self.base._scf.nuc_grad_method().kernel(atmlst=atmlst)
 
-    def _analytic_components(self, xy, atmlst):
+    def _analytic_components(self, xy, atmlst, with_response=True):
+        """Return gradient components, or only M when with_response=False."""
         tdobj = self.base
         options = {
             "atmlst": atmlst,
             "tolerance": self.cphf_conv_tol,
             "max_cycle": self.cphf_max_cycle,
+            "with_response": with_response,
         }
         if tdobj.deltaS == -1:
             return delta_s_minus_one.grad_elec(

@@ -376,7 +376,7 @@ def spin_raising_response_projection_q(
 
 def grad_elec(
         gradient_driver, tdobj, xy, atmlst=None, tolerance=1e-12,
-        max_cycle=None):
+        max_cycle=None, with_response=True):
     """Build the complete analytic excitation gradient for deltaS=+1."""
     if tdobj.deltaS != 1:
         raise ValueError("deltaS=+1 gradient received a different spin channel")
@@ -535,6 +535,9 @@ def grad_elec(
             local[1] += contractions[zvector_slot]
             return local
 
+    # The Hessian needs M without an extra gradient Z-vector solve.
+    if not with_response:
+        return m_matrix
     return finish_gradient(
         gradient_driver,
         tdobj,

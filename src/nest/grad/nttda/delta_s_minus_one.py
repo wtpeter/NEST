@@ -403,7 +403,8 @@ def spin_lowering_fock_projections(tdobj, xy):
         amplitudes.cv.T @ amplitudes.cv / spin
         + amplitudes.ov.T @ amplitudes.ov * 2.0 / (2.0 * spin - 1.0)
     )
-    t_cv = gamma * (1.0 + 1.0 / spin) * trace_oo * amplitudes.cv
+    # OO-CV and its transpose each contribute -gamma/S * Tr(X_OO) X_CV:Fz.
+    t_cv = 2.0 * gamma / spin * trace_oo * amplitudes.cv
     t_beta_vo = (
         2.0 * eta * amplitudes.cv.T @ amplitudes.co
         + 2.0 * zeta * amplitudes.ov.T @ amplitudes.oo
@@ -1044,7 +1045,7 @@ def spin_lowering_fockz_hfx_terms(
 
 def grad_elec(
         gradient_driver, tdobj, xy, atmlst=None, tolerance=1e-12,
-        max_cycle=None):
+        max_cycle=None, with_response=True):
     """Build the complete analytic excitation gradient for deltaS=-1."""
     if tdobj.deltaS != -1:
         raise ValueError("deltaS=-1 gradient received a different spin channel")
@@ -1200,6 +1201,9 @@ def grad_elec(
             local[1] += contractions[zvector_slot]
             return local
 
+    # The Hessian needs M without an extra gradient Z-vector solve.
+    if not with_response:
+        return m_matrix
     # 4-5. ROKS transpose-Hessian adjoint, Dz Fock derivative, and Pulay term.
     return finish_gradient(
         gradient_driver,

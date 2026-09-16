@@ -1041,7 +1041,7 @@ def same_spin_ledger_scalar(tdobj, xy, max_memory=None, return_parts=False):
 
 def grad_elec(
         gradient_driver, tdobj, xy, atmlst=None, tolerance=1e-12,
-        max_cycle=None):
+        max_cycle=None, with_response=True):
     """Build the complete analytic excitation gradient for deltaS=0.
 
     The function follows the physical order of the Lagrangian: native
@@ -1207,6 +1207,9 @@ def grad_elec(
             return local
 
     # 4-5. ROKS transpose-Hessian adjoint, Dz Fock derivative, and Pulay term.
+    # The Hessian needs M without an extra gradient Z-vector solve.
+    if not with_response:
+        return m_matrix
     return finish_gradient(
         gradient_driver,
         tdobj,

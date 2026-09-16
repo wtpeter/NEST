@@ -219,7 +219,8 @@ def spin_lowering_fock_projections(tdobj, xy):
         amplitudes.cv.T @ amplitudes.cv / spin
         + amplitudes.ov.T @ amplitudes.ov * 2.0 / (2.0 * spin - 1.0)
     )
-    t_cv = gamma * (1.0 + 1.0 / spin) * trace_oo * amplitudes.cv
+    # OO-CV and its transpose each contribute -gamma/S.
+    t_cv = 2.0 * gamma / spin * trace_oo * amplitudes.cv
     t_beta_vo = (
         2.0 * eta * amplitudes.cv.T @ amplitudes.co
         + 2.0 * zeta * amplitudes.ov.T @ amplitudes.oo

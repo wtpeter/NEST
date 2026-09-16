@@ -773,7 +773,7 @@ class NTTDA(TDBase):
     Gradients = nuc_grad_method
 
     def Hessian(self):
-        """Return the dense analytic HF NTTDA nuclear-Hessian driver."""
+        """Return the analytic HF / fixed-grid DFT NTTDA Hessian driver."""
         from nest.hessian.nttda import Hessian
 
         return Hessian(self)
