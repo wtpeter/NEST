@@ -120,6 +120,8 @@ nt = roks.NTTDA()
 ```
 
 See [`examples`](examples) for complete calculations.
+For fixed-orbital physical-state C-PCM energies with SF-TDA and NT-TDA, see
+the [solvent examples, model definition, and validation](examples/solvent/README.md).
 
 ## License
 

@@ -1,0 +1,12 @@
+10
+PubChem 3D conformer: acetone; https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/acetone/record/SDF?record_type=3d
+O 0.0003 -1.3171 -0.0002
+C 0.0000 -0.0872 0.0006
+C 1.2810 0.7024 -0.0002
+C -1.2813 0.7019 -0.0002
+H 1.3279 1.3235 -0.8980
+H 1.3260 1.3282 0.8945
+H 2.1351 0.0196 0.0027
+H -2.1352 0.0187 0.0027
+H -1.3284 1.3230 -0.8980
+H -1.3266 1.3278 0.8945
