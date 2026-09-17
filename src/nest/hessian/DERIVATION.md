@@ -1,8 +1,8 @@
 # NTTDA analytic nuclear Hessian
 
-This implementation uses matrix-free iterative response solves and a dense
-integral backend for conventional all-electron ROKS, with real full-rank spatial
-orbitals. The integral backend still limits it to small systems.
+This implementation uses matrix-free iterative response solves and direct
+shell-contracted integrals for conventional all-electron ROKS, with real
+full-rank spatial orbitals. XC derivatives use blocked quadrature.
 HF, LDA, GGA, tau-dependent MGGA, and their full-range global hybrids are
 supported in all three NTTDA sectors. The target must be an isolated state.
 DFT holds the quadrature coordinates and weights fixed and requires analytic
@@ -95,8 +95,9 @@ rule. For `nobeta=True`, the common Fock potential is evaluated at the
 equal-spin density, while the actual reference residual remains unchanged.
 This separation also holds in first and second derivatives.
 
-The production HF action consumes the semilocal response through an
-effective tensor `g_eff[p,r,s,q] = hybrid*g[p,r,s,q] - K_ref[p,q,r,s]`.
+The production HF action consumes the semilocal response as if contracted with
+`g_eff[p,r,s,q] = hybrid*g[p,r,s,q] - K_ref[p,q,r,s]`; the XC part of this
+tensor is never constructed in the contracted backend.
 Its exchange contraction yields the ordinary kernel action and its Coulomb
 contraction yields the recoupled kernel action. Actual reference J/K, energy,
 and spin potentials are computed separately; `g_eff` is only a response tensor.
@@ -187,10 +188,10 @@ energy derivative. Neither orbital Jacobian is assembled. Define
 [Q(A-\omega)Q+XX^T]X_a=-Q\bar A_aX,\qquad X^T X_a=0.
 \]
 
-Each application calls the native NTTDA channel algebra with the cached MO
-integrals and XC kernel. DFT state-response iterations therefore avoid repeated
-grid integration; this cache is part of the dense integral backend, not an
-assembled state matrix. The complete
+Each application calls the native NTTDA channel algebra with direct integral
+actions and a factored XC kernel. DFT state-response iterations reuse grid
+orbital factors and already contracted XC coefficients; they do not reevaluate
+LibXC or build a four-index XC tensor. The complete
 channel space participates, including the lowering zero mode; only the target
 state is projected out. No full state matrix, inverse, or eigensystem is built.
 The rank-one term only fixes the parallel component, without shifting physical
@@ -205,10 +206,10 @@ GMRES retains at most 40 Krylov vectors, uses an absolute residual tolerance
 entries below `1e-4` are clipped only in the preconditioner. The true residual
 is checked after every solve; failed convergence raises an error. Diagnostics
 are `response_residual` and cumulative `response_iterations` by equation type.
-`solver='dense'` retains the independent original Jacobian/eigensystem path for
-small-system comparisons. It also retains the original AO product-rule
-transforms; the iterative path reuses MO-transformed skeleton derivatives and
-contracts only differentiated slots in the second derivative.
+`solver='dense'` retains the independent Jacobian/eigensystem path for
+small-system comparisons. Both solvers use direct integral contractions;
+`dense` refers only to the response matrices. Explicit AO integral derivative
+tensors are confined to small-system test oracles.
 
 The stored target eigenvector is checked against the native action using
 `max(1e-7, td.conv_tol)`. The reference residual norm is checked against
@@ -258,16 +259,205 @@ without changing the scalar state.  Translation sum rules, atom ordering and
 the closed-shell spin-raising limit are checked separately.  Symmetry alone
 is insufficient: the implementation evaluates one triangle and reflects it.
 
-The dense ERIs still limit practical system size, even with iterative response
-solves. Integral storage scales as approximately `(40 + 3*Nselected)*NAO**4`
-doubles, before DFT grid tensors and existing process memory. For 10 selected
-atoms, this estimate is 3.5 GB at 50 AOs and 56 GB at 100 AOs. This is not yet a
-large-system Hessian. Direct/shell-blocked derivative contractions and blocked
-XC fourth-derivative integration remain necessary for that use case.
-The driver estimates memory before allocating derivative tensors, including
-effective XC fourth-derivative tensors. The backend must supply analytic
+The driver estimates memory before allocating response and derivative
+workspaces, including compact XC factors and block-local fourth-derivative
+tensors. There is no full AO/MO ERI or ERI derivative tensor in either solver.
+The backend must supply analytic
 fourth derivatives; a missing capability raises an error, without a numerical
 fallback or backend switch.
+
+### Direct ERI backend
+
+`eri.DirectERI` represents a derivative by product-rule terms containing four
+AO-to-MO coefficient factors, a libcint integral name/component, and atom shell
+restrictions. For example, with chemists' ERI slots `(i,j,k,l)`, the Coulomb
+action transforms `D` onto slots `(l,k)`, calls the shell contraction, and
+transforms the exposed `(i,j)` potential back to MOs. The exchange action uses
+input slots `(j,k)` and output slots `(i,l)`. Neither operation requires the
+four-index MO tensor. Differentiated coefficient matrices enter these same
+input/output transformations.
+
+The first derivative has four AO-center terms and four coefficient terms.
+The mixed derivative includes all 16 AO-center placements, AO-center/coefficient
+cross terms, four `C_AB` terms, and twelve ordered `C_A`/`C_B` terms on distinct
+slots. Two different atoms cannot differentiate the same AO center. Nuclear
+first derivatives have a minus sign; second derivatives have a plus sign.
+Permutations retain the Cartesian component order and directed density layout.
+
+Contractions use `pyscf.scf.jk.get_jk` / `direct_bindm`, with atom shell slices
+and batches bounded using both available memory and OpenMP thread count.
+Ordinary ERIs use `s8`; `ip1`, `ipip1`, and `ipvip1` use `s2kl`; `ip1ip2`
+uses `s1`. The `s2kl` path relabels only the undifferentiated `(k,l)` pair
+and explicitly transposes density/output indices into supported contraction
+scripts. It does not assume symmetric transition densities.
+The implementation follows the derivative Schwarz-bound construction in
+PySCF's RHF gradient/Hessian. Integral optimizers and shell-pair bounds are
+cached once per geometry and integral type and shared by all directions.
+PySCF's derivative prescreens assume particular contraction layouts; NTTDA
+uses more permutations and rectangular density slices, so the density bound
+is a conservative uniform maximum over the batch. This preserves shell
+Schwarz screening without imposing closed-shell density symmetry.
+
+Within a mixed nuclear derivative block, already contracted AO potentials
+are reused across Cartesian directions and output coefficient factors. All
+three/nine libcint components are kept together, as in PySCF's RHF Hessian;
+otherwise selecting one component would repeatedly evaluate the same integral
+batch. The cache is capped at 32 MB (or 5% of `max_memory`, whichever is
+smaller), includes density-key storage in its accounting, and is cleared for
+each new atom pair. A full cache falls back to direct evaluation. No integral
+quartets or four-index tensors enter this cache. Response iterations do not
+cache their changing trial densities.
+
+Local source references inspected for this implementation:
+
+- PySCF `34e5aa023`: `pyscf/hessian/rhf.py`, `_partial_hess_ejk`, `_make_vhfopt`,
+  `_get_jk`; `pyscf/grad/rhf.py`, `_calc_q_cond`.
+- gpu4pyscf `b3525ad`: `gpu4pyscf/hessian/rhf.py`, `_get_jk_ip1` and
+  `_partial_ejk_ip2`. Its GPU kernels accumulate contracted potentials or
+  atomic Hessian entries and reuse screened shell-pair data. They assume
+  RHF/limited density layouts, so they are not called directly for NTTDA.
+
+The Hessian uses a private copy of the reference whose `get_jk` is bound to
+`pyscf.scf.hf.SCF.get_jk`, the direct implementation. This also covers the
+automatic TD setup, native orbital response and gradient adjoint reused by
+the Hessian. Setting
+`direct_scf=True` alone would not suffice: `RHF.get_jk` can automatically
+allocate incore ERIs when it estimates enough memory. The user's original
+SCF object and any cache it already owns are preserved.
+
+Integral-related retained storage is quadratic in AO count for fixed numbers
+of nuclear directions and density probes, plus shell-local libcint buffers.
+Only the optional dense response solver retains quadratic response matrices.
+Direct evaluation removes the integral-storage bottleneck; it does not by
+itself promise sub-quartic time or validate large-molecule conditioning.
+
+Tests compare both J/K actions to explicit derivatives for nonsymmetric
+densities, spherical/Cartesian bases, orbital-only changes, and same/different
+atom mixed derivatives. An end-to-end HF/PBE/B3LYP test rejects every full
+`Mole.intor('int2e*')` request during the Hessian and checks that the user's
+SCF cache is untouched.
+
+### Direct-backend validation (2026-09-17)
+
+With analytic fourth derivatives enabled, the Hessian and orbital-gradient
+derivative suites passed **71 tests, 1 skipped**. The skip is the negative
+capability check under a library that supplies the requested capability.
+The five direct-ERI tests also passed after extending the allocation guard
+to automatic TD setup. Coverage includes gradient finite differences,
+iterative/dense response agreement, and explicit/contracted XC and ERI
+derivatives. Production code does not use finite differences.
+
+The supplied asymmetric H2O2 geometry, 6-31G*, and previously saved dense
+central states/Hessians were reused to isolate the backend change. DFT used
+the default level-3 grid (47,784 points), fixed quadrature and `max_memory=4000`.
+These comparisons retained the earlier validation SCF settings; they do not
+require those settings for ordinary use. All runs below used five threads per
+process, with at most twenty threads across concurrent validation jobs.
+Times exclude SCF/TD setup, and are not isolated-machine speed benchmarks.
+Peak RSS includes the Python process, SCF/TD setup and retained allocator memory.
+
+| XC | deltaS | Hessian scope | Time / s | Peak RSS / MiB | Max difference from saved dense result / Eh Bohr^-2 |
+| --- | ---: | --- | ---: | ---: | ---: |
+| HF | -1 | Complete 12x12 | 124.1 | 184 | 3.18e-11 |
+| HF | 0 | Complete 12x12 | 129.4 | 197 | 2.38e-11 |
+| HF | +1 | Complete 12x12 | 84.6 | 198 | 7.39e-11 |
+| PBE | 0 | First oxygen 3x3 | 227.2 | 1104 | 1.07e-12 |
+| B3LYP | 0 | First oxygen 3x3 | 289.0 | 1141 | 1.32e-12 |
+
+HF rows share one process, so their reported peak is cumulative. All three
+PBE and B3LYP channels were also checked before the final symmetry/cache
+optimizations; maximum differences were below `3.1e-12 Eh/Bohr^2`. These
+backend comparisons verify preservation of the previous analytic results;
+they do not resolve the finite-difference accuracy limits documented below.
+
+A separate integral-storage check used the same geometry with aug-cc-pVTZ:
+138 AOs and 44 shells. A mixed second derivative of J and K, with two
+nonsymmetric probe densities and full `Mole.intor` calls forbidden, finished
+in 46.2 seconds using five threads. Peak process RSS was **191.6 MiB**;
+bilinear reciprocity errors were below `8e-17`. This checks the direct
+integral action, **not a complete 138-AO Hessian**. Large-molecule response
+convergence and full-Hessian runtime remain to be benchmarked.
+
+Logs, comparison scripts and raw arrays are retained in the parent workspace
+under `Temp/nttda_hessian/direct_eri/`. The runnable default-settings example
+is `examples/hessian/04_dft_blocked_xc.py`. It also completed with unmodified
+SCF/TD/grid defaults: PBE, deltaS=-1, the first oxygen's 3x3 block, 223.1 seconds
+using five threads, and a maximum response residual of `5.52e-11`.
+
+### Contracted XC backend (first optimization stage)
+
+`xc.Semilocal` evaluates AO values and LibXC derivatives in blocks of at most
+1,024 grid points (smaller when the available-memory estimate requires it).
+It contracts third/fourth derivatives with first/second density responses
+within each block. Only orbital factors and two-feature XC coefficients are
+retained. It never constructs `P[x,g,i,j]` or `K[i,j,k,l]`.
+
+The density feature can be written as a short sum
+`P[x,g,i,j] = sum_ab c[x,a,b] phi[a,g,i] phi[b,g,j]`, including the
+gradient product rule and, for MGGA, the `tau = sum |grad(phi)|**2 / 2` term.
+The direct action `K[i,j,k,l] D[k,l]` first forms the scalar density features
+of `D`. For the recoupled action `K[i,j,k,l] D[j,l]`, the contraction instead
+forms `phi[b] D phi[d].T` at each grid point. Both reconstruct only the exposed
+MO matrix. First and mixed-second nuclear derivatives use the same operations
+with differentiated orbital factors; all product-rule terms are retained.
+This follows the density-first contraction used by the SF-TDA gradient while
+also supporting NTTDA's recoupled index pattern.
+
+For fixed density-feature count, retained XC storage scales as `O(G*NAO)`
+plus `O(G*nvar**2)` coefficients. Uncontracted fourth derivatives require only
+`O(block_size*(2*nvar)**4)` storage. Response probes are processed in batches
+of at most eight. AO evaluation and LibXC calls are repeated for each nuclear
+derivative direction/pair; iterative state-response actions reuse the compact
+base kernel. The ROKS response solver and its tolerance are unchanged.
+
+The test-only explicit implementation in `tests/_xc_dense_reference.py`
+checks values, first derivatives, mixed derivatives, and both kernel actions
+against the previous dense formulas using nonsymmetric density probes. The
+MGGA algebra comparison excludes the ill-conditioned vacuum tail; complete
+grid MGGA Hessian/gradient finite differences are tested separately. No density
+cutoff was added to production code.
+
+Validation after this rewrite (2026-09-17): the Hessian and gradient orbital
+derivative suites passed 62 tests, with one capability-guard test skipped under
+the fourth-derivative LibXC build. All four new explicit-vs-contracted XC
+tests passed (SVWN, PBE, B3LYP, TPSS). The missing-fourth-derivative guard also
+passed when run separately with the original LibXC binary. No gradient
+formulas or response convergence tolerances were changed in this rewrite.
+`examples/hessian/04_dft_blocked_xc.py` illustrates PBE on the asymmetric
+H2O2/6-31G* geometry with default SCF, TD, and grid settings and 4,000 MB memory.
+That example completed in 268 s with a response residual of `5.52e-11`.
+For 32 AOs, 47,784 grid points and one selected atom, the driver's approximate
+additional-memory estimate decreases from 14.01 GB to 1.27 GB. A single
+uncontracted GGA fourth-derivative array decreases from 1,493 MiB over the
+full grid to 32 MiB per 1,024-point block; the `G*nvar*NAO**2` pair array
+(also 1,493 MiB here) is eliminated entirely. The estimate includes dense
+ERI storage but excludes memory already in use by the process.
+
+The following measurements predate the direct ERI backend. On the same
+geometry and default level-3 grid, the first oxygen's 3x3 block
+was compared against the saved pre-rewrite dense-backend Hessian. These
+comparisons used `conv_tol=1e-12` SCF and the supplied explicit `get_ab` state
+construction to match the saved oracle; the Hessian response remained
+iterative with its usual `1e-10` residual threshold. The new driver used
+`max_memory=4000` MB for every channel.
+
+| XC | deltaS | Max difference / Eh Bohr^-2 | Hessian time / s | Process peak RSS / MiB |
+| --- | ---: | ---: | ---: | ---: |
+| PBE | -1 | 1.69e-12 | 257 | 1469 |
+| PBE | 0 | 7.51e-13 | 281 | 1471 |
+| PBE | +1 | 3.33e-12 | 118 | 1527 |
+| B3LYP | -1 | 7.18e-13 | 259 | 1472 |
+| B3LYP | 0 | 6.89e-13 | 260 | 1483 |
+| B3LYP | +1 | 1.00e-12 | 101 | 1483 |
+
+Peak RSS is the cumulative process high-water mark for each functional's
+three-channel run, including SCF/state construction. Timings exclude that
+setup and were obtained with 36 OpenMP threads and passive waiting while
+other validation jobs were running; they are not an isolated speedup
+benchmark. These H2O2 comparisons establish equivalence to the saved dense
+backend for the selected block. Independent finite-difference correctness
+checks are supplied by the regression suites above; a new full-molecule
+H2O2 finite-difference scan was not repeated for this algebraic rewrite.
 
 ## Running DFT with fourth derivatives
 
@@ -289,7 +479,7 @@ cmake -S Temp/nttda_hessian/libxc-7.0.0 \
 cmake --build Temp/nttda_hessian/libxc-build -j 16
 LIBXC4=$(realpath Temp/nttda_hessian/libxc-build/libxc.so)
 cd src/NEST
-OMP_NUM_THREADS=36 LD_PRELOAD="$LIBXC4" conda run --no-capture-output -n nest-soc \
+OMP_NUM_THREADS=20 LD_PRELOAD="$LIBXC4" conda run --no-capture-output -n nest-soc \
   python -m pytest src/nest/hessian/tests/test_nttda.py -q
 ```
 
@@ -339,7 +529,7 @@ energy stencil by `3.9e-11 Eh/Bohr` for the gradient and `1.3e-8 Eh/Bohr^2`
 for the Hessian. The response residual is `9.6e-11`; the translation sum-rule
 residual is `5.3e-12 Eh/Bohr^2`.
 
-One local run of `02_compare_solvers.py`, with `OMP_NUM_THREADS=36` and
+Before the direct ERI rewrite, one local run of `02_compare_solvers.py`, with `OMP_NUM_THREADS=36` and
 `OMP_WAIT_POLICY=PASSIVE`, gave the following times. SCF/TD setup is excluded;
 the timed calculation is the first lowering root's H1-H1 3x3 Hessian block.
 These are illustrative single-run timings, not large-system performance claims.
@@ -350,8 +540,8 @@ These are illustrative single-run timings, not large-system performance claims.
 | 6-31G | 13 | 0.597 | 0.651 | 4.0e-12 |
 | cc-pVDZ | 24 | 8.123 | 2.577 | 9.9e-12 |
 
-Iteration overhead loses at the smallest sizes. The 24-AO case is about 3.2x
-faster with the default path. This comparison includes both iterative solves
+In that historical implementation, iteration overhead loses at the smallest
+sizes and the 24-AO case was about 3.2x faster with the default path. This comparison includes both iterative solves
 and the reuse of MO skeleton tensors; it does not isolate GMRES alone.
 
 The original LibXC environment passed 36 tests across the full and incremental
@@ -359,7 +549,7 @@ tolerance runs, with 28 fourth-derivative DFT Hessian tests skipped. The combine
 command is:
 
 ```bash
-OMP_NUM_THREADS=36 OMP_WAIT_POLICY=PASSIVE conda run --no-capture-output -n nest-soc \
+OMP_NUM_THREADS=20 OMP_WAIT_POLICY=PASSIVE conda run --no-capture-output -n nest-soc \
   python -m pytest --import-mode=importlib -q \
   src/nest/hessian/tests/test_nttda.py src/nest/nttda/tests/test_nttda.py \
   src/nest/soc/tests/test_soc_ao.py src/nest/soc/tests/test_sftda_soc.py \
@@ -380,7 +570,7 @@ the final changed numerical paths; no finite differences are used in the
 production Hessian. Global `ruff check src/nest` and `git diff --check` passed.
 
 ```bash
-OMP_NUM_THREADS=36 OMP_WAIT_POLICY=PASSIVE LD_PRELOAD="$LIBXC4" \
+OMP_NUM_THREADS=20 OMP_WAIT_POLICY=PASSIVE LD_PRELOAD="$LIBXC4" \
   conda run --no-capture-output -n nest-soc python -m pytest -q \
   src/nest/hessian/tests/test_nttda.py src/nest/grad/tests/test_nttda_grad.py \
   src/nest/grad/tests/test_nttda_orbital_derivative.py
@@ -505,8 +695,9 @@ The explicit-A scan was repeated for PBE and B3LYP with the same geometry,
 basis, spin, and `nobeta=False`. Both used the default level-3 quadrature
 (47,784 points), held fixed at all displaced geometries, and LibXC 7.0.0 built
 with fourth derivatives. SCF used `conv_tol=1e-12` with the default orbital
-gradient threshold; `max_memory=32000` MB was needed because the Hessian's
-additional-memory estimate was about 14 GB. No production derivative formulas
+gradient threshold; the original dense XC backend required `max_memory=32000`
+MB because its additional-memory estimate was about 14 GB. This is a historical
+measurement, superseded by the contracted backend above. No production derivative formulas
 were changed for this check.
 
 At every geometry all three explicit A matrices were checked against random

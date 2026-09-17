@@ -1,8 +1,8 @@
-"""Compare iterative responses/MO reuse with the original dense reference.
+"""Compare iterative and explicitly assembled response equations.
 
-    OMP_NUM_THREADS=36 conda run --no-capture-output -n nest-soc python examples/hessian/02_compare_solvers.py
+    OMP_NUM_THREADS=20 conda run --no-capture-output -n nest-soc python examples/hessian/02_compare_solvers.py
 
-Both paths still store dense derivative integrals. Timings are for one atom's
+Both paths use direct derivative integral contractions. Timings are for one atom's
 3x3 Hessian block and exclude SCF/TD setup; they are not large-system benchmarks.
 """
 

@@ -8,7 +8,8 @@ from pyscf import dft, gto
 from pyscf.hessian import rhf as rhf_hess
 
 from nest.nttda import NTTDA
-from nest.hessian.nttda import _eri_first, _eri_second, _overlap_second
+from nest.hessian.nttda import _overlap_second
+from nest.hessian.tests._eri_dense_reference import _eri_first, _eri_second
 
 
 def reference(mol, xc='HF', grid=None):

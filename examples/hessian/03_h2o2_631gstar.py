@@ -1,6 +1,6 @@
 """Full HF NTTDA derivative validation on asymmetric H2O2 / 6-31G*.
 
-    OMP_NUM_THREADS=36 conda run --no-capture-output -n nest-soc python examples/hessian/03_h2o2_631gstar.py
+    OMP_NUM_THREADS=20 conda run --no-capture-output -n nest-soc python examples/hessian/03_h2o2_631gstar.py
 
 Coordinates are Angstrom; neutral triplet reference, no symmetry, nobeta=False.
 All three channels use their lowest computed scalar state. Each full analytic

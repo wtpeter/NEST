@@ -1,4 +1,4 @@
-"""Analytic NTTDA Hessian with iterative responses and dense integral tensors.
+"""Analytic NTTDA Hessian with iterative responses and direct integral actions.
 
 The integral derivatives are analytic libcint derivatives.  Orbital and state
 responses are solved at one geometry; no displaced SCF/gradient is used here.
@@ -7,14 +7,17 @@ See ``DERIVATION.md`` for the constrained second-derivative formula.
 
 import copy
 import itertools
+import types
 
 import numpy as np
 from pyscf import dft, lib
 from pyscf.hessian import rhf as rhf_hess
 from pyscf.lib import logger
+from pyscf.scf import hf
 
 from nest.grad.nttda.roks import canonical_pairs, pack_m_matrix
 from .response import orbital_actions, solve as solve_response
+from .eri import DirectERI
 
 
 def _transform(tensor, coefficients):
@@ -53,26 +56,6 @@ def _second_transform(tensor, ta, tb, tab, c, ca, cb, cab):
     return result
 
 
-def _second_mo_transform(tensor, ta, tb, tab, ua, ub, uab):
-    """Product rule after transforming each skeleton tensor to MOs once.
-
-    C_a=C u_a and C_ab=C u_ab. Only differentiated MO slots need another
-    contraction; repeatedly transforming the unchanged slots costs 4x more
-    for a four-index tensor. The dense solver retains the AO expression as
-    an independent oracle.
-    """
-    result = tab.copy()
-    for slot in range(tensor.ndim):
-        result += np.moveaxis(np.tensordot(ta, ub, axes=(slot, 0)), -1, slot)
-        result += np.moveaxis(np.tensordot(tb, ua, axes=(slot, 0)), -1, slot)
-        result += np.moveaxis(np.tensordot(tensor, uab, axes=(slot, 0)), -1, slot)
-        first = np.moveaxis(np.tensordot(tensor, ua, axes=(slot, 0)), -1, slot)
-        for other in range(tensor.ndim):
-            if other != slot:
-                result += np.moveaxis(np.tensordot(first, ub, axes=(other, 0)), -1, other)
-    return result
-
-
 def _rotation(vector, pairs, nmo):
     result = np.zeros((nmo, nmo))
     for value, (p, q, _) in zip(vector, pairs):
@@ -87,26 +70,30 @@ def _mo_operators(tdobj, h, eri, pairs, xc=None):
     Calling the existing HF NTTDA action in an identity MO basis preserves all
     channel coefficients and amplitude layouts.  This also works for integral
     derivatives because all three outputs are linear in h and (pq|rs).
-    Optional XC values/derivatives supply the nonlinear semilocal contributions.
+    Optional XC values/derivatives supply contracted semilocal kernel actions.
     """
     occ = np.asarray(tdobj._scf.mo_occ)
     da = np.diag((occ > 0).astype(float))
     db = np.diag((occ == 2).astype(float))
 
     hybrid = tdobj._scf._numint.rsh_and_hybrid_coeff(tdobj._scf.xc, tdobj.mol.spin)[2]
-    j = np.einsum('pqrs,sr->pq', eri, da + db)
-    fa = h + j - hybrid * np.einsum('prsq,rs->pq', eri, da)
-    fb = h + j - hybrid * np.einsum('prsq,rs->pq', eri, db)
+    if isinstance(eri, np.ndarray):  # Explicit tensor oracle used by small tests.
+        def integral_action(dm, exchange=False):
+            script = 'prsq,...rs->...pq' if exchange else 'pqrs,...sr->...pq'
+            return np.einsum(script, eri, dm, optimize=True)
+    else:
+        integral_action = eri.apply
+    j = integral_action(da + db)
+    ka, kb = integral_action(np.asarray((da, db)), exchange=True) if hybrid else (0., 0.)
+    fa = h + j - hybrid * ka
+    fb = h + j - hybrid * kb
     energy = 0.5 * (np.einsum('pq,pq', da, h + fa) + np.einsum('pq,pq', db, h + fb))
-    response_eri = hybrid * eri
+    kernel = None
     if xc is not None:
         energy_xc, potential, kernel, common = xc
         energy += energy_xc
         fa = fa + potential[0]
         fb = fb + potential[1]
-        # -K(response_eri) is K_ref, while -J(response_eri) is its
-        # recoupled contraction.  The semilocal tensor is (pq|rs)_kernel.
-        response_eri = response_eri - kernel.transpose(0, 2, 3, 1)
     residual_focks = {'co': fb, 'cv': fa + fb, 'ov': fa}
     residual = np.asarray([
         residual_focks[name][p, q]
@@ -118,13 +105,19 @@ def _mo_operators(tdobj, h, eri, pairs, xc=None):
         fb = fb + correction
 
     def get_j(mol, dm, hermi=0, **kwargs):
-        return np.einsum('pqrs,...sr->...pq', response_eri, dm, optimize=True)
+        out = hybrid * integral_action(dm) if hybrid else np.zeros_like(dm)
+        if kernel is not None:
+            out -= kernel.apply(dm, exchange=True)
+        return out
 
     def get_k(mol, dm, hermi=0, **kwargs):
-        return np.einsum('prsq,...rs->...pq', response_eri, dm, optimize=True)
+        out = hybrid * integral_action(dm, exchange=True) if hybrid else np.zeros_like(dm)
+        if kernel is not None:
+            out -= kernel.apply(dm)
+        return out
 
     mf = copy.copy(tdobj._scf)
-    # All semilocal terms have already been supplied as MO tensors.
+    # Native channel algebra consumes only J/K actions and Fock matrices.
     mf.xc = 'HF'
     mf.mo_coeff = np.eye(len(occ))
     mf.get_j = get_j
@@ -137,45 +130,6 @@ def _mo_operators(tdobj, h, eri, pairs, xc=None):
     return energy, residual, action
 
 
-# Eight chemists' ERI symmetries, used to place differentiated AO slots.
-_ERI_PERMUTATIONS = (
-    (0, 1, 2, 3), (1, 0, 2, 3), (0, 1, 3, 2), (1, 0, 3, 2),
-    (2, 3, 0, 1), (3, 2, 0, 1), (2, 3, 1, 0), (3, 2, 1, 0),
-)
-
-
-def _eri_first(ip1, mask, xyz):
-    result = np.zeros_like(ip1[0])
-    for slot in range(4):
-        permutation = next(p for p in _ERI_PERMUTATIONS if p[slot] == 0)
-        shape = [1] * 4
-        shape[slot] = len(mask)
-        # Nuclear displacement is minus the AO electronic-coordinate derivative.
-        result -= ip1[xyz].transpose(permutation) * mask.reshape(shape)
-    return result
-
-
-def _eri_second(ipip1, ipvip1, ip1ip2, mask_a, mask_b, xyz_a, xyz_b):
-    result = np.zeros_like(ipip1[0, 0])
-    for first, second in itertools.product(range(4), repeat=2):
-        if first == second:
-            primitive = ipip1
-            permutation = next(p for p in _ERI_PERMUTATIONS if p[first] == 0)
-        else:
-            partner = 1 if first // 2 == second // 2 else 2
-            primitive = ipvip1 if partner == 1 else ip1ip2
-            permutation = next(
-                p for p in _ERI_PERMUTATIONS if p[first] == 0 and p[second] == partner
-            )
-        shape_a = [1] * 4
-        shape_b = [1] * 4
-        shape_a[first] = len(mask_a)
-        shape_b[second] = len(mask_b)
-        result += (primitive[xyz_a, xyz_b].transpose(permutation)
-                   * mask_a.reshape(shape_a) * mask_b.reshape(shape_b))
-    return result
-
-
 def _overlap_second(saa, sab, mask_a, mask_b, xyz_a, xyz_b):
     same = mask_a * mask_b
     aa = saa[xyz_a, xyz_b]
@@ -186,14 +140,14 @@ def _overlap_second(saa, sab, mask_a, mask_b, xyz_a, xyz_b):
 
 
 class Hessian(lib.StreamObject):
-    """Small-system analytic HF / fixed-grid DFT total-energy Hessian.
+    """Analytic HF / fixed-grid DFT total-energy Hessian with direct integrals.
 
     ``kernel(state=1)`` uses one-based NTTDA roots and returns
     ``(natm, natm, 3, 3)`` in Eh/Bohr**2.  ``atmlst`` selects both atom axes.
     Only isolated states, real full-rank MOs, and conventional all-electron
     integrals are supported. DFT requires analytic XC fourth derivatives and
     holds grid coordinates and weights fixed. Responses default to matrix-free
-    GMRES, but dense integral storage still scales steeply with system size.
+    GMRES. AO integrals and their derivatives are contracted by shell batches.
     """
 
     _keys = {'base', 'mol', 'state', 'atmlst', 'de', 'response_residual', 'state_gap',
@@ -251,8 +205,20 @@ class Hessian(lib.StreamObject):
             raise ValueError('deltaS must be -1, 0, or 1')
         if not mf.converged:
             raise RuntimeError('ROKS reference is not converged')
+        # RHF.get_jk may allocate incore ERIs even with direct_scf=True.
+        # Use the direct SCF method on a private reference, including automatic
+        # TD setup and the gradient/response routines reused by the Hessian.
+        mf = copy.copy(mf)
+        mf._eri = None
+        mf._opt = {}
+        mf.direct_scf = True
+        mf.get_jk = types.MethodType(hf.SCF.get_jk, mf)
+        td = copy.copy(td)
+        td._scf = mf
         if td.xy is None:
             td.run()
+            for name in ('e', 'xy', 'converged', 'nstates'):
+                setattr(self.base, name, getattr(td, name))
         if not isinstance(self.state, (int, np.integer)) or not 1 <= self.state <= len(td.xy):
             raise ValueError('state must select an existing one-based NTTDA root')
         if not atoms or len(set(atoms)) != len(atoms) or any(a < 0 or a >= mol.natm for a in atoms):
@@ -268,16 +234,18 @@ class Hessian(lib.StreamObject):
         vector = np.asarray(td.xy[self.state - 1][0]).ravel()
         ndim = len(vector)
         ncoord = 3 * len(atoms)
-        # AO derivative buffers, stored first derivatives, and dense response matrices.
+        # Density/potential batches, orbital derivatives and response vectors.
         response_size = 5 * ndim**2 + 3 * nrot**2 if self.solver == 'dense' else 45 * (ndim + nrot)
-        required_mb = 8e-6 * ((40 + ncoord) * nao**4 + response_size)
+        required_mb = 8e-6 * ((160 + 6*ncoord) * nao**2 + response_size)
         if xctype != 'HF':
             nvar = {'LDA': 1, 'GGA': 4, 'MGGA': 5}[xctype]
-            required_mb += 8e-6 * len(mf.grids.weights) * (
-                4 * (20 + ncoord) * nao + 5 * nvar * nao**2 + 3 * (2 * nvar)**4
-            )
+            # Compact factors for base/first/second kernel actions, plus one
+            # block of uncontracted XC derivatives. No G*N**2 pair tensors.
+            required_mb += 8e-6 * (
+                len(mf.grids.weights) * (48 * nao + 32 * nvar**2)
+                + min(1024, len(mf.grids.weights)) * (3 * (2*nvar)**4 + 100*nao))
         if required_mb > self.max_memory - lib.current_memory()[0]:
-            raise MemoryError('dense NTTDA Hessian needs approximately %.0f MB of additional memory' % required_mb)
+            raise MemoryError('NTTDA Hessian needs approximately %.0f MB of additional memory' % required_mb)
         log = logger.new_logger(self)
         log.info('Analytic %s NTTDA Hessian: state %d, %d rotations, %d amplitudes', xctype, self.state, nrot, ndim)
         xc_grid = None
@@ -288,9 +256,8 @@ class Hessian(lib.StreamObject):
             xc_grid = Semilocal(mf)
             xc0 = xc_grid.terms()
         h = mf.get_hcore()
-        eri = mol.intor('int2e', aosym='s1')
         hm = c.T @ h @ c
-        gm = _transform(eri, [c] * 4)
+        gm = DirectERI(mol, c, max_memory=self.max_memory)
         _, residual, action = _mo_operators(td, hm, gm, pairs, xc0)
         self.reference_residual = float(np.linalg.norm(residual))
         # Respect the reference's declared accuracy, including PySCF's factor
@@ -319,8 +286,8 @@ class Hessian(lib.StreamObject):
             gaps[root] = np.inf
             self.state_gap = float(np.min(np.abs(gaps)))
         else:
-            # The MO-integral action above is the same native channel algebra.
-            # Reuse its cached XC kernel instead of reintegrating the grid in
+            # The direct integral action uses the same native channel algebra.
+            # Reuse its factored XC kernel instead of reevaluating LibXC in
             # every state-response iteration. Only the preconditioner diagonal
             # is needed from the original AO/grid action.
             _, state_diagonal = {1: td.gen_vind_sfu, 0: td.gen_vind_sc, -1: td.gen_vind_sfd}[td.deltaS]()
@@ -349,15 +316,14 @@ class Hessian(lib.StreamObject):
         # R_q and E_q in the orthonormal MO chart C(q,R)=C0 S_m(R)^(-1/2) exp(K(q)).
         identity = np.eye(nao)
         zeros_h = np.zeros_like(hm)
-        zeros_g = np.zeros_like(gm)
         if self.solver == 'dense':
             jacobian = np.zeros((nrot, nrot))
             energy_q = np.zeros(nrot)
             for index in range(nrot):
                 k = _rotation(np.eye(1, nrot, index).ravel(), pairs, nao)
                 hq = _first_transform(hm, zeros_h, identity, k)
-                gq = _first_transform(gm, zeros_g, identity, k)
-                xcq = None if xc_grid is None else xc_grid.terms(xc_grid.phi @ k)
+                gq = gm.derivative((None, 0, c @ k))
+                xcq = None if xc_grid is None else xc_grid.terms((None, 0, c @ k))
                 eq, rq, aq = _mo_operators(td, hq, gq, pairs, xcq)
                 jacobian[:, index] = rq
                 energy_q[index] = eq + x @ aq(x[None])[0]
@@ -383,10 +349,6 @@ class Hessian(lib.StreamObject):
         h1gen = grad.hcore_generator(mol)
         h2gen = rhf_hess.Hessian(mf).hcore_generator(mol)
         saa, sab, s1 = rhf_hess.get_ovlp(mol)
-        ip1 = mol.intor('int2e_ip1', comp=3, aosym='s1')
-        ipip1 = mol.intor('int2e_ipip1', comp=9, aosym='s1').reshape(3, 3, *eri.shape)
-        ipvip1 = mol.intor('int2e_ipvip1', comp=9, aosym='s1').reshape(3, 3, *eri.shape)
-        ip1ip2 = mol.intor('int2e_ip1ip2', comp=9, aosym='s1').reshape(3, 3, *eri.shape)
         masks = {}
         for atom in atoms:
             p0, p1 = mol.aoslice_by_atom()[atom, 2:]
@@ -400,15 +362,12 @@ class Hessian(lib.StreamObject):
             mask = masks[atom]
             for xyz in range(3):
                 sa = c.T @ (s1[xyz] * mask[:, None] + s1[xyz].T * mask[None, :]) @ c
-                ga = _eri_first(ip1, mask, xyz)
                 ca_metric = -0.5 * c @ sa
                 hsk = _first_transform(h, ha[xyz], c, ca_metric)
-                gsk = _first_transform(eri, ga, c, ca_metric)
-                phi_sk = None
+                gsk = gm.derivative((atom, xyz, ca_metric))
                 xc_sk = None
                 if xc_grid is not None:
-                    phi_sk = xc_grid.ao_derivative(mask, xyz) @ c + xc_grid.ao0 @ ca_metric
-                    xc_sk = xc_grid.terms(phi_sk)
+                    xc_sk = xc_grid.terms((atom, xyz, ca_metric))
                 _, rsk, _ = _mo_operators(td, hsk, gsk, pairs, xc_sk)
                 if self.solver == 'dense':
                     q = np.linalg.solve(jacobian, -rsk)
@@ -419,9 +378,9 @@ class Hessian(lib.StreamObject):
                 k = _rotation(q, pairs, nao)
                 ca = c @ (k - 0.5 * sa)
                 ht = hsk + _first_transform(hm, zeros_h, identity, k)
-                gt = gsk + _first_transform(gm, zeros_g, identity, k)
-                phi_a = None if xc_grid is None else phi_sk + xc_grid.phi @ k
-                xc_a = None if xc_grid is None else xc_grid.terms(phi_a)
+                gt = gm.derivative((atom, xyz, ca))
+                xc_direction = None if xc_grid is None else (atom, xyz, ca)
+                xc_a = None if xc_grid is None else xc_grid.terms(xc_direction)
                 _, _, at = _mo_operators(td, ht, gt, pairs, xc_a)
                 ax = at(x[None])[0]
                 if self.solver == 'dense':
@@ -437,10 +396,7 @@ class Hessian(lib.StreamObject):
                     self.response_iterations['state'] += cycles
                 a1x.append(ax)
                 state_response.append(xa)
-                # The iterative path reuses MO skeleton derivatives in every
-                # mixed derivative instead of repeating four AO transforms.
-                stored_ga = ga if self.solver == 'dense' else _transform(ga, [c] * 4)
-                first.append((ha[xyz], stored_ga, sa, k, ca, phi_a))
+                first.append((ha[xyz], sa, k, ca, xc_direction))
         self.response_residual = float(max(response_errors))
         tolerance = self.conv_tol if self.solver == 'iterative' else 1e-8
         if self.response_residual > tolerance:
@@ -452,34 +408,26 @@ class Hessian(lib.StreamObject):
         for ia, atom_a in enumerate(atoms):
             for ib in range(ia + 1):
                 atom_b = atoms[ib]
+                # Retain all Cartesian components of contracted J/K matrices
+                # only for this atom pair, never four-index integral tensors.
+                gm.clear_potential_cache()
                 hab = h2gen(atom_a, atom_b)
                 for xyz_a, xyz_b in itertools.product(range(3), repeat=2):
                     index_a, index_b = 3 * ia + xyz_a, 3 * ib + xyz_b
                     if index_a < index_b:
                         continue
-                    ha, ga, sa, ka, ca, phi_a = first[index_a]
-                    hb, gb, sb, kb, cb, phi_b = first[index_b]
+                    ha, sa, ka, ca, xc_a_direction = first[index_a]
+                    hb, sb, kb, cb, xc_b_direction = first[index_b]
                     sab_mo = c.T @ _overlap_second(saa, sab, masks[atom_a], masks[atom_b], xyz_a, xyz_b) @ c
                     # Mixed derivative of S_m^(-1/2) exp(K), with q_AB set to zero.
                     uab = (-0.5 * sab_mo + 0.375 * (sa @ sb + sb @ sa)
                            - 0.5 * (sa @ kb + sb @ ka) + 0.5 * (ka @ kb + kb @ ka))
                     cab = c @ uab
-                    gab = _eri_second(ipip1, ipvip1, ip1ip2, masks[atom_a], masks[atom_b], xyz_a, xyz_b)
                     htotal = _second_transform(h, ha, hb, hab[xyz_a, xyz_b], c, ca, cb, cab)
-                    if self.solver == 'dense':
-                        gtotal = _second_transform(eri, ga, gb, gab, c, ca, cb, cab)
-                    else:
-                        gtotal = _second_mo_transform(
-                            gm, ga, gb, _transform(gab, [c] * 4),
-                            ka - 0.5*sa, kb - 0.5*sb, uab,
-                        )
+                    gtotal = gm.derivative((atom_a, xyz_a, ca), (atom_b, xyz_b, cb), cab)
                     xc_ab = None
                     if xc_grid is not None:
-                        phi_ab = (xc_grid.ao_derivative(masks[atom_a] * masks[atom_b], xyz_a, xyz_b) @ c
-                                  + xc_grid.ao_derivative(masks[atom_a], xyz_a) @ cb
-                                  + xc_grid.ao_derivative(masks[atom_b], xyz_b) @ ca
-                                  + xc_grid.ao0 @ cab)
-                        xc_ab = xc_grid.terms(phi_a, phi_b, phi_ab)
+                        xc_ab = xc_grid.terms(xc_a_direction, xc_b_direction, cab)
                     eab, rab, aab = _mo_operators(td, htotal, gtotal, pairs, xc_ab)
                     value = (eab + x @ aab(x[None])[0] - z @ rab
                              + state_response[index_a] @ a1x[index_b]

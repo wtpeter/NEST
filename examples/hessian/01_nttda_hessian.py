@@ -1,10 +1,10 @@
 """Analytic total-energy Hessian and an independent energy-difference check.
 
 Run from the NEST checkout:
-    OMP_NUM_THREADS=36 conda run --no-capture-output -n nest-soc python examples/hessian/01_nttda_hessian.py
+    OMP_NUM_THREADS=20 conda run --no-capture-output -n nest-soc python examples/hessian/01_nttda_hessian.py
 
-Small-system integral backend: response solves are iterative, but AO integral
-derivatives are still dense. See src/nest/hessian/DERIVATION.md for limits.
+Response solves are iterative and AO integral derivatives are contracted
+directly. See src/nest/hessian/DERIVATION.md for the supported references.
 For DFT, use a LibXC build with fourth derivatives; quadrature is held fixed.
 """
 
