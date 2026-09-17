@@ -21,6 +21,11 @@ OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 MKL_NUM_THREADS=2 \
   同时输出根间重叠，帮助跟踪同一个电子态。
 - `04_ct.py`：文章 SI 中 5 Å 的乙烯/四氟乙烯二聚体，打印各根的片段电荷。
   先通过电荷变化辨认 CT 态，再比较其溶剂位移。
+- `05_ss_validation.py`：甲醛与 CT 二聚体，在相同慢溶剂环境中比较 ptSS
+  和目标态自洽 SS，并比较直接迭代与 DIIS。
+- `06_lr_validation.py`：完整小模型空间的耦合 LR，及人为近简并两能级的混合。
+
+第二批的模型核对、独立验证及误差表见 [VALIDATION.md](VALIDATION.md)。
 
 脚本开头设置了保守的线程默认值，外部可覆盖，最高 20。所有能量内部使用
 Hartree，打印的能隙使用 eV。例子采用较小网格便于试算；定量工作应检查 DFT
@@ -59,6 +64,8 @@ vertical_gaps = calculation.vertical(method='ptss')
 | `e_ptss`, `ptss_correction` | 最近一次 ptSS 总能量及修正 |
 | `e_ptlr`, `ptlr_correction` | 最近一次 ptLR 总能量及修正 |
 | `cycles`, `history` | 外循环次数及每轮能量、密度变化、跟踪重叠 |
+| `e_ss`, `ss_dm`, `ss_td`, `ss_state` | 最近一次非平衡目标态 SS 的总能量、密度、谱及最终根编号 |
+| `ss_converged`, `ss_cycles`, `ss_history` | 非平衡目标态 SS 的收敛状态、轮数和历史 |
 
 每次 `vertical` 清空上一次修正结果，只保留本次选定方法的结果字段。
 `td.e` 保存固定场本征值；用 `vertical()` 的返回值读取最终物理能隙。
@@ -106,8 +113,10 @@ $$\Delta\omega_k^{\rm ptLR}=
 只作为孤立根的一阶近似。测试通过非平衡能量的二阶差分检查其符号和系数。
 
 `ptss` 与 `ptlr` 是两种分别报告的近似，当前驱动分别求值。自洽 SS 的比较
-可通过另建驱动并选择另一个物理根实现。平衡态总能量之差和非平衡垂直能隙
-对应不同的溶剂条件，例子会给出明确标签。
+可使用 `state_specific(state=2)`：根编号来自共同固定场谱，该方法固定出发态
+慢极化，只迭代目标态及快极化。返回相对于出发态的非平衡 SS 能隙。
+目标态与整个溶剂平衡的能量可通过另建驱动并选择该物理根执行 `kernel` 获得。
+`diis_space=6` 可加速这两个外循环；默认值 0 保持直接迭代。
 
 ## 如何判断验证结果
 
@@ -166,7 +175,8 @@ OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 MKL_NUM_THREADS=2 \
 python -m ruff check .
 ```
 
-上述回归得到 **45 个测试及 13 个子测试通过**，Ruff 检查通过。密度测试包含
+第一批回归得到 **45 个测试及 13 个子测试通过**，Ruff 检查通过。第二批增加
+非平衡 SS 与耦合 LR 验证后，共 **51 个测试及 15 个子测试通过**。密度测试包含
 显式行列式展开与费米产生/湮灭算符的独立比较，覆盖 NT 的三个自旋分支及
 SF 的两个翻转方向；能量测试覆盖气相极限、共同溶剂环境、ptSS 二次展开和
 ptLR 的能量曲率。
@@ -180,7 +190,8 @@ ptLR 的能量曲率。
 - `geometries/c2h4_c2f4_5A.xyz`：Alam 等的补充材料原始坐标。
 - [Alam et al., JCP 156, 194110 (2022)](https://doi.org/10.1063/5.0091636)：
   物理态自洽和共享出发态环境的 ptSS 流程。论文使用 Marcus 分割及相应极化功项；
-  本实现以上述共同环境展开定义非平衡能量，文献算例用于方法比较。
+  本实现使用 Pekar 共同环境展开，两者的 C-PCM 总极化自由能等价，推导与数值
+  核对见 [VALIDATION.md](VALIDATION.md)。文献算例用于方法比较。
 - [p-Nitroaniline solvatochromism, J. Phys. Chem. A](https://doi.org/10.1021/jp110026c)。
 - [Acetone solvatochromism](https://research.rug.nl/en/publications/solvatochromism-of-the-%CF%80-n-transition-of-acetone-by-combined-quan/)。
 

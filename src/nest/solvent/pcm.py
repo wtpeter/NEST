@@ -225,6 +225,10 @@ class StateSpecificPCM(lib.StreamObject):
     root. Both use Hartree. A different spin sector on the *same SCF object*
     may be supplied to ``vertical(td)``. Results are stored in ``td`` (frozen
     field amplitudes), ``e_frozen``, ``e_ptss`` and ``ptss_correction``.
+    ``state_specific(state, td=None)`` relaxes one target in the source's
+    fixed slow-polarization environment and returns its SS gap. Set
+    ``diis_space=6`` to accelerate either outer loop; the default 0 uses
+    direct iteration.
 
     Each geometry requires a new driver and converged gas-phase reference.
     Gradients, TDDFT X/Y amplitudes and orbital relaxation are not implemented.
@@ -251,6 +255,7 @@ class StateSpecificPCM(lib.StreamObject):
         self.max_cycle = 30
         self.conv_tol = 1e-8
         self.conv_tol_dm = 1e-6
+        self.diis_space = 0
         self.converged = False
         self.cycles = 0
         self.e_tot = None
@@ -266,6 +271,10 @@ class StateSpecificPCM(lib.StreamObject):
         self._equilibrium_xy = None
         self.state = None
         self.history = []
+        self.ss_converged = False
+        self.e_ss = self.ss_dm = self.ss_td = self.ss_state = None
+        self.ss_cycles = 0
+        self.ss_history = []
         dm_ref = np.asarray(td._scf.make_rdm1())
         self._dm_ref = dm_ref.sum(axis=0) if dm_ref.ndim == 3 else dm_ref
         self._gas_response = self._build_response(self.base)
@@ -353,6 +362,10 @@ class StateSpecificPCM(lib.StreamObject):
         self.e_frozen = self.e_ptss = self.e_ptlr = None
         self.ptss_correction = self.ptlr_correction = None
         self._equilibrium_xy = None
+        self.ss_converged = False
+        self.e_ss = self.ss_dm = self.ss_td = self.ss_state = None
+        self.ss_cycles = 0
+        self.ss_history = []
         td = self._solve(self.base, self._gas_response, np.zeros_like(self._dm_ref))
         self.gas_td = td
         if state > len(td.xy):
@@ -360,6 +373,9 @@ class StateSpecificPCM(lib.StreamObject):
         previous = np.asarray(td.xy[state - 1][0]).ravel()
         dm = state_density(td, state).real
         e_last = None
+        extrapolator = lib.diis.DIIS(self, incore=True) if self.diis_space >= 2 else None
+        if extrapolator is not None:
+            extrapolator.space = self.diis_space
         for cycle in range(1, self.max_cycle + 1):
             _, v = self.with_solvent.kernel(dm)
             x0 = np.array([np.asarray(x).ravel() for x, _ in td.xy])
@@ -384,11 +400,75 @@ class StateSpecificPCM(lib.StreamObject):
                 self.converged = True
                 self._equilibrium_xy = (td.xy[root][0].copy(), 0)
                 break
-            e_last, dm = energy, dm_new
+            e_last = energy
+            dm = dm_new if extrapolator is None else extrapolator.update(dm_new, xerr=dm_new-dm)
             previous = np.asarray(td.xy[root][0]).ravel()
         if not self.converged:
             raise RuntimeError(f'Physical-state PCM did not converge in {self.max_cycle} cycles.')
         return self.e_tot
+
+    def state_specific(self, state, td=None):
+        """Return one non-equilibrium SS gap, keeping the source slow field fixed.
+
+        ``state`` indexes the common-field (``vertical(method='frozen')``)
+        spectrum, starting at one. Follow that root while relaxing the fast
+        polarization and its amplitudes. Reference orbitals stay fixed.
+        The source ``dm``, ``v``, ``e_tot`` and ``state`` are preserved.
+        Target results are stored in ``e_ss``, ``ss_dm``, ``ss_td``,
+        ``ss_state``, ``ss_cycles``, ``ss_history`` and ``ss_converged``.
+        ``ss_td`` contains the final target-field spectrum; its other roots
+        share the target's field and are available for state analysis only.
+        Initialization refreshes ``vertical(method='frozen')`` results;
+        save previously computed ptSS/ptLR gaps before calling this method.
+        """
+        self.ss_converged = False
+        self.e_ss = self.ss_dm = self.ss_td = self.ss_state = None
+        self.ss_cycles = 0
+        self.ss_history = []
+        template = self.base if td is None else td
+        if not isinstance(state, (int, np.integer)) or not 1 <= state <= template.nstates:
+            raise ValueError('state must index a common-field root (1-based).')
+        self.vertical(td, method='frozen')
+        work = self.td
+        if state > len(work.xy):
+            raise ValueError('The requested root is outside the common-field spectrum.')
+        gas_response = self._gas_response if td is None else self._build_response(td)
+        fast = self.with_solvent.copy().reset()
+        fast.eps = self.eps_optical
+        e_pcm, _ = self.with_solvent.kernel(self.dm)
+        previous = np.asarray(work.xy[state - 1][0]).ravel()
+        dm = state_density(work, state).real
+        e_last = None
+        extrapolator = lib.diis.DIIS(self, incore=True) if self.diis_space >= 2 else None
+        if extrapolator is not None:
+            extrapolator.space = self.diis_space
+        for cycle in range(1, self.max_cycle + 1):
+            potential = self.v + fast._B_dot_x(dm - self.dm)
+            x0 = np.array([np.asarray(x).ravel() for x, _ in work.xy])
+            work = self._solve(template, gas_response, potential, x0=x0)
+            overlaps = np.array([abs(np.vdot(previous, x)) for x, _ in work.xy])
+            root = int(overlaps.argmax())
+            if overlaps[root] < 0.5:
+                raise RuntimeError('Lost the target root during non-equilibrium SS iteration; inspect more roots.')
+            dm_new = state_density(work, root + 1).real
+            delta = dm_new - self.dm
+            e_gas = work.e[root] - np.einsum('ij,ji', potential, dm_new - self._dm_ref)
+            energy = float(self.base._scf.e_tot + e_gas + e_pcm + np.einsum('ij,ji', self.v, delta)
+                           + 0.5 * np.einsum('ij,ji', delta, fast._B_dot_x(delta)))
+            error = np.linalg.norm(dm_new - dm)
+            de = np.inf if e_last is None else energy - e_last
+            self.ss_history.append((energy, error, float(overlaps[root])))
+            self.e_ss, self.ss_dm, self.ss_td = energy, dm_new, work
+            self.ss_state, self.ss_cycles = root + 1, cycle
+            logger.info(self, 'Non-equilibrium SS cycle %d: root=%d G=%.12f dG=%.3g |dD|=%.3g overlap=%.6f',
+                        cycle, root + 1, energy, de, error, overlaps[root])
+            if abs(de) < self.conv_tol and error < self.conv_tol_dm:
+                self.ss_converged = True
+                return energy - self.e_tot
+            e_last = energy
+            dm = dm_new if extrapolator is None else extrapolator.update(dm_new, xerr=dm_new-dm)
+            previous = np.asarray(work.xy[root][0]).ravel()
+        raise RuntimeError(f'Non-equilibrium SS did not converge in {self.max_cycle} cycles.')
 
     def vertical(self, td=None, method='ptss'):
         """Return vertical gaps (Hartree) in this state's environment.
