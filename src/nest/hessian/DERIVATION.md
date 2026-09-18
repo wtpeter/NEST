@@ -480,7 +480,7 @@ cmake --build Temp/nttda_hessian/libxc-build -j 16
 LIBXC4=$(realpath Temp/nttda_hessian/libxc-build/libxc.so)
 cd src/NEST
 OMP_NUM_THREADS=20 LD_PRELOAD="$LIBXC4" conda run --no-capture-output -n nest-soc \
-  python -m pytest src/nest/hessian/tests/test_nttda.py -q
+  python -m pytest src/nest/hessian/tests/test_nttda_hessian.py -q
 ```
 
 Downloaded archive SHA256:
@@ -551,7 +551,7 @@ command is:
 ```bash
 OMP_NUM_THREADS=20 OMP_WAIT_POLICY=PASSIVE conda run --no-capture-output -n nest-soc \
   python -m pytest --import-mode=importlib -q \
-  src/nest/hessian/tests/test_nttda.py src/nest/nttda/tests/test_nttda.py \
+  src/nest/hessian/tests/test_nttda_hessian.py src/nest/nttda/tests/test_nttda.py \
   src/nest/soc/tests/test_soc_ao.py src/nest/soc/tests/test_sftda_soc.py \
   src/nest/soc/tests/test_sftddft_soc.py src/nest/soc/tests/test_nttda_soc.py
 ```
@@ -572,7 +572,7 @@ production Hessian. Global `ruff check src/nest` and `git diff --check` passed.
 ```bash
 OMP_NUM_THREADS=20 OMP_WAIT_POLICY=PASSIVE LD_PRELOAD="$LIBXC4" \
   conda run --no-capture-output -n nest-soc python -m pytest -q \
-  src/nest/hessian/tests/test_nttda.py src/nest/grad/tests/test_nttda_grad.py \
+  src/nest/hessian/tests/test_nttda_hessian.py src/nest/grad/tests/test_nttda_grad.py \
   src/nest/grad/tests/test_nttda_orbital_derivative.py
 ```
 

@@ -53,7 +53,7 @@ def test_direct_derivative_actions(cart, monkeypatch):
 @pytest.mark.parametrize('xc,delta_s', [('HF', -1), ('PBE', 0), ('B3LYP', 1)])
 def test_hessian_never_builds_full_eri(xc, delta_s, monkeypatch):
     from pyscf.dft import libxc
-    from nest.hessian.tests.test_nttda import reference, dense_td
+    from nest.hessian.tests.test_nttda_hessian import reference, dense_td
     if xc != 'HF' and libxc.max_deriv_order(xc) < 4:
         pytest.skip('requires fourth XC derivatives')
     mf = reference(gto.M(atom='C 0 0 0; H 1.4 .2 1.1; H -1.2 0 1.3',

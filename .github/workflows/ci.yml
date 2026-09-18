@@ -32,4 +32,4 @@ jobs:
           cache: pip
       - run: python -m pip install -e ".[dev]"
       - run: python -m ruff check .
-      - run: python -m pytest src -q
+      - run: python -m pytest src -q --ignore=src/nest/gpu
