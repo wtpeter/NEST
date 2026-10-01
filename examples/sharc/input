@@ -1,0 +1,23 @@
+geomfile "geom"
+veloc external
+velocfile "veloc"
+nstates 3 0 3
+charge 0 0 0
+state 2 mch
+coeff auto
+rngseed 26933
+ezero -38.570985220764186
+tmax 0.2
+stepsize 0.1
+nsubsteps 25
+surf sharc
+coupling overlap
+nogradcorrect
+nophases_from_interface
+phase_correction_algo zhou2020
+ekincorrect parallel_vel
+decoherence_scheme edc
+decoherence_param 0.1
+select_directly
+output_format ascii
+printlevel 3

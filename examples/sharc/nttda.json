@@ -1,0 +1,1 @@
+{"basis":"sto-3g","xc":"PBE","grid_level":0,"soctype":"SOMF","triplets":"nttda","density_fit":true,"auxbasis":"def2-universal-jkfit","overlap_backend":"gpu"}
