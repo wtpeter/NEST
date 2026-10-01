@@ -230,7 +230,7 @@ def _dipoles(td, triplet=None):
 
 
 def _triplet_gradients(td, cphf_conv_tol=1e-10):
-    """All ordinary-ROKS triplet gradients with one geometry-local cache.
+    """All NT-TDA triplet gradients with one geometry-local cache.
 
     The reference term is common to all roots; ``grad_elec`` supplies the
     excitation derivative using the public driver and its response cache.
@@ -260,18 +260,24 @@ def run(qmin, config_path, output=None):
     allowed = {'basis', 'xc', 'grid_level', 'soctype', 'scf_conv_tol', 'scf_conv_tol_grad', 'td_conv_tol',
                'cphf_conv_tol', 'min_overlap', 'max_cycle', 'triplets', 'density_fit',
                'auxbasis', 'scf_diis_cycles', 'scf_newton_cycles', 'overlap_backend',
-               'wfoverlap_executable', 'overlap_memory_mb', 'min_reference_overlap', 'initial_reference'}
+               'wfoverlap_executable', 'overlap_memory_mb', 'min_reference_overlap', 'initial_reference',
+               'reference_model'}
     unknown = set(config)-allowed
     if unknown:
         raise ValueError(f'Unknown configuration keys: {sorted(unknown)}')
     if config.get('overlap_backend', 'gpu') not in ('gpu', 'wfoverlap', 'python'):
         raise ValueError('overlap_backend must be gpu, wfoverlap or python')
+    reference_model = config.get('reference_model', 'roks')
+    if reference_model not in ('roks', 'ensemble_roks'):
+        raise ValueError('reference_model must be roks or ensemble_roks')
     ntriplets = int(requests['states'][2])
     triplet_mode = config.get('triplets', 'nttda')
     if triplet_mode not in ('nttda', 'reference') or (triplet_mode == 'reference' and ntriplets != 1):
         raise ValueError('triplets must be nttda or reference (requires one triplet)')
     if triplet_mode == 'nttda' and 'nacdr' in requests:
         raise NotImplementedError('Excited triplet dynamics requires SHARC coupling overlap; deltaS=0 NAC is unavailable')
+    if reference_model == 'ensemble_roks' and triplet_mode != 'nttda':
+        raise NotImplementedError('EnsembleROKS integration requires both NT-TDA spin sectors and overlap coupling')
     dimension = nroots+3*ntriplets
     mol = gto.M(atom=atoms, unit=unit, basis=config.get('basis', 'sto-3g'),
                 spin=2, charge=charge, verbose=0)
@@ -295,6 +301,11 @@ def run(qmin, config_path, output=None):
         from gpu4pyscf.dft.roks import ROKS
         from gpu4pyscf.sftda import NTTDA_ROKS
         from gpu4pyscf.grad.nttda import compute_frame
+        if reference_model == 'ensemble_roks':
+            from gpu4pyscf.sftda import EnsembleROKS, NTTDA_EnsembleROKS
+            reference_class, td_class = EnsembleROKS, NTTDA_EnsembleROKS
+        else:
+            reference_class, td_class = ROKS, NTTDA_ROKS
         timings = {}
         diagnostics = {'step': step}
         stage_start = time.monotonic()
@@ -307,7 +318,7 @@ def run(qmin, config_path, output=None):
             print(f'Step {step}: {name} {timings[name]:.3f} s', flush=True)
             stage_start = now
 
-        mf = ROKS(mol, xc=config.get('xc', 'PBE'))
+        mf = reference_class(mol, xc=config.get('xc', 'PBE'))
         if config.get('density_fit', False):
             mf = mf.density_fit(auxbasis=config.get('auxbasis', 'def2-universal-jkfit'))
         mf.conv_tol = config.get('scf_conv_tol', 1e-10)
@@ -343,9 +354,9 @@ def run(qmin, config_path, output=None):
             newton.kernel(mf.mo_coeff, mf.mo_occ)
             mf = newton.undo_soscf()
         if not mf.converged:
-            raise RuntimeError('ROKS reference did not converge, including Newton fallback')
+            raise RuntimeError(f'{reference_model} reference did not converge, including Newton fallback')
         timed_stage('reference')
-        td = NTTDA_ROKS(mf).set(deltaS=-1, nstates=nroots,
+        td = td_class(mf).set(deltaS=-1, nstates=nroots,
                                  conv_tol=config.get('td_conv_tol', 1e-10),
                                  max_cycle=config.get('max_cycle', 200)).run()
         if len(td.e) != nroots or not np.all(td.converged):
@@ -356,8 +367,8 @@ def run(qmin, config_path, output=None):
             diagnostics['reference_overlap'] = float(reference_value)
             print(f'Step {step}: reference overlap {reference_value:.10f}', flush=True)
             if abs(reference_value) < config.get('min_reference_overlap', 0.9):
-                raise RuntimeError('ROKS reference changed discontinuously; inspect the SCF branch or reduce timestep')
-        triplet = (NTTDA_ROKS(mf).set(deltaS=0, nstates=ntriplets,
+                raise RuntimeError(f'{reference_model} reference changed discontinuously; inspect the orbital branch and reference model')
+        triplet = (td_class(mf).set(deltaS=0, nstates=ntriplets,
                                     conv_tol=config.get('td_conv_tol', 1e-10),
                                     max_cycle=config.get('max_cycle', 200)).run()
                    if triplet_mode == 'nttda' else None)
@@ -368,7 +379,8 @@ def run(qmin, config_path, output=None):
                              include_reference=triplet is None,
                              soctype=config.get('soctype', 'SOMF')).run()
         order = canonical_order(soc)
-        h = soc.h_soc[np.ix_(order, order)] + float(mf.e_tot)*np.eye(dimension)
+        reference_energy = td.reference_energy()
+        h = soc.h_soc[np.ix_(order, order)] + reference_energy*np.eye(dimension)
         timed_stage('soc')
         overlap_start = time.monotonic()
         ovlp = (overlaps(previous, td, previous_triplet, triplet,
@@ -411,8 +423,11 @@ def run(qmin, config_path, output=None):
             np.savez_compressed(savedir/f'wavefunction-triplet-{step}.npz', **_snapshot(triplet))
         np.savez_compressed(cache, signature=signature, has_nac='nacdr' in requests, **result)
         diagnostics.update(timings_seconds=timings,
-                           singlet_energies_hartree=(float(mf.e_tot)+np.asarray(td.e)).tolist(),
-                           triplet_energies_hartree=(float(mf.e_tot)+np.asarray(triplet.e)).tolist() if triplet is not None else [float(mf.e_tot)])
+                           reference_model=reference_model,
+                           reference_energy_hartree=reference_energy,
+                           orbital_objective_hartree=float(mf.e_tot),
+                           singlet_energies_hartree=(reference_energy+np.asarray(td.e)).tolist(),
+                           triplet_energies_hartree=(reference_energy+np.asarray(triplet.e)).tolist() if triplet is not None else [reference_energy])
         diagnostic_path = savedir/f'frame-{step}.json'
         diagnostic_tmp = diagnostic_path.with_suffix('.json.tmp')
         diagnostic_tmp.write_text(json.dumps(diagnostics, indent=2)+'\n')

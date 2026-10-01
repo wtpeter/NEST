@@ -81,3 +81,31 @@ def test_soc_dipoles_and_overlap_follow_root_phase(solution):
     np.testing.assert_allclose(overlaps(to_nest(solution), flipped), gauge, atol=1e-9)
     original_dm, flipped_dm = _dipoles(solution), _dipoles(flipped)
     np.testing.assert_allclose(flipped_dm, gauge @ original_dm @ gauge, atol=1e-10)
+
+
+def test_ensemble_bridge_keeps_selected_energy_zero(solution):
+    import cupy as cp
+    from pyscf import dft
+    from gpu4pyscf.sftda import EnsembleROKS, NTTDA_EnsembleROKS
+    from nest.soc.gpu_nttda import to_nest
+    from nest.interfaces.sharc_nttda import _snapshot
+    mf = EnsembleROKS(solution.mol, xc='PBE').set(conv_tol=1e-12, conv_tol_grad=1e-8)
+    mf.grids.level = 0
+    mf.small_rho_cutoff = 0
+    mf.run()
+    assert mf.converged
+    td = NTTDA_EnsembleROKS(mf).set(deltaS=-1, nstates=3, conv_tol=1e-10).run()
+    assert np.all(td.converged)
+    # Independently evaluate the selected high-spin reference on the CPU,
+    # with identical ensemble orbitals and quadrature; do not optimize it.
+    cpu = dft.ROKS(mf.mol, xc=mf.xc)
+    cpu.grids.coords = cp.asnumpy(mf.grids.coords)
+    cpu.grids.weights = cp.asnumpy(mf.grids.weights)
+    cpu.small_rho_cutoff = 0
+    dm = cpu.make_rdm1(cp.asnumpy(mf.mo_coeff), cp.asnumpy(mf.mo_occ))
+    expected = cpu.energy_tot(dm, cpu.get_hcore(), cpu.get_veff(dm=dm))
+    assert abs(expected - mf.e_tot) > 1e-4
+    carrier = to_nest(td)
+    np.testing.assert_allclose(carrier._scf.e_tot, expected, atol=1e-9, rtol=0)
+    np.testing.assert_allclose(_snapshot(td)['e_tot'], expected, atol=1e-9, rtol=0)
+    np.testing.assert_allclose(carrier._scf.e_tot + carrier.e, td.e_tot, atol=1e-12, rtol=0)

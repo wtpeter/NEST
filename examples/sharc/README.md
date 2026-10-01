@@ -33,7 +33,7 @@ orthonormalize them and use fixed-occupation Newton directly. This avoids
 Aufbau/DIIS switching ROKS reference solutions. `min_reference_overlap` (0.9)
 stops discontinuous reference changes before propagation. SOMF is the default
 SOC model; `soctype: "Zeff"` is also supported.
-NT-TDA excitation energies are shifted by the common reference SCF energy.
+NT-TDA excitation energies are shifted by the selected reference energy.
 `scf_conv_tol_grad` defaults to 1e-8; the Newton inner AH tolerance is tightened
 consistently with that orbital residual. For a controlled initial SCF guess,
 `initial_reference` accepts a wavefunction snapshot from this interface,
@@ -41,6 +41,19 @@ resolved relative to the configuration file. Its orbitals are projected and
 relaxed with fixed occupations; the initial overlap matrix remains identity.
 The atom order, electron count and spin must agree. An initial guess does not
 replace convergence checks or enforce a chosen electronic state.
+
+`reference_model: "roks"` is the default. The experimental
+`reference_model: "ensemble_roks"` instead uses GPU `EnsembleROKS` and
+`NTTDA_EnsembleROKS` in both spin sectors, with exactly two open orbitals.
+This is fixed average-occupation orbital optimization, not state-weighted
+CASSCF/GOK optimization. It changes the electronic model and its spectrum;
+it is not a numerical recovery of the ordinary ROKS solution. Its NT-TDA
+energy zero is the high-spin ROKS energy on the ensemble orbitals,
+`td.reference_energy()`, rather than the ensemble objective `mf.e_tot`.
+The GPU gradients include that selected reference's nonstationary orbital
+response. SOC and overlap use the same ensemble orbitals/amplitudes.
+Use this option only with `triplets: "nttda"` and overlap coupling;
+the single-reference-triplet DDR path is not implemented for it.
 
 The default `overlap_backend: "gpu"` uses exact spin-adapted contractions in
 `nest.nttda.overlap_contraction`. The cross-geometry AO metric is evaluated
@@ -85,8 +98,11 @@ one geometry-local response cache and one common reference gradient.
 
 Validated: real restricted molecular ROKS with exactly two open orbitals,
 deltaS=-1/0, DF gradients, phase covariance and small overlap SOC trajectories.
-Ensemble reference dynamics, solvent/relativistic SCF, SOC derivatives,
-laser-driven dynamics, and production crossing/long-time convergence are not
-validated. SHARC uses its usual approximation omitting explicit SOC derivatives.
+The ensemble option has a selected-energy-zero regression against an
+independent CPU fixed-orbital ROKS evaluation, and a 2-thiouracil continuity
+and one-component gradient probe. Full ensemble reference dynamics,
+solvent/relativistic SCF, SOC derivatives, laser-driven dynamics, and production
+crossing/long-time convergence require further validation. SHARC uses its usual
+approximation omitting explicit SOC derivatives.
 State-space completeness, timestep, SOC model and electronic convergence
 remain system-dependent research choices.

@@ -31,7 +31,9 @@ def to_nest(td):
     mf.mo_coeff = host(td._scf.mo_coeff)
     mf.mo_occ = host(td._scf.mo_occ)
     mf.mo_energy = host(td._scf.mo_energy)
-    mf.e_tot = float(td._scf.e_tot)
+    # EnsembleROKS optimizes an ensemble objective but defines NT-TDA total
+    # energies with the high-spin ROKS energy on those same orbitals.
+    mf.e_tot = float(td.reference_energy())
     mf.converged = True
     mf.verbose = td.verbose
     if mf.mo_coeff.ndim != 2 or mf.mo_occ.ndim != 1:
@@ -52,7 +54,8 @@ def from_gpu_nttda(td, *others, soctype='SOMF', include_reference=False):
     """Return a NEST SOC driver; call ``kernel()`` or ``run()`` to evaluate.
 
     NEST's Hamiltonian contains excitation energies relative to the common
-    SCF reference. Add ``td._scf.e_tot * I`` for absolute energies in SHARC.
+    selected reference. Add ``td.reference_energy() * I`` for absolute
+    energies in SHARC; the ensemble optimization objective is a different zero.
     """
     return SOC([to_nest(item) for item in (td, *others)],
                soctype=soctype, include_reference=include_reference)
