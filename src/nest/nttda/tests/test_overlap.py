@@ -33,7 +33,36 @@ def synthetic(delta_s, seed=83):
                            converged=np.ones(4, dtype=bool))
 
 
+def rectangular_pair(sector):
+    rng = np.random.default_rng(608)
+    left = synthetic(sector)
+    # Different virtual counts and occupation orders, equal occupied spins.
+    occupations = np.array([0, 2, 1, 0, 2, 1, 0, 0])
+    nc, no, nv = 2, 2, 4
+    size = (nc+no)*(no+nv) if sector == -1 else nc*no+2*nc*nv+1+no*nv
+    x = rng.normal(size=(size, 3))
+    if sector == -1:
+        i, j = nc*(no+nv), (nc+1)*(no+nv)+1
+        trace = x[i]+x[j]; x[i]-=trace/2; x[j]-=trace/2
+    x = np.linalg.qr(x)[0].T
+    right = SimpleNamespace(_scf=SimpleNamespace(mo_occ=occupations),
+                            xy=[(a*np.exp(.2j*i), 0) for i, a in enumerate(x)], deltaS=sector)
+    mo = rng.normal(size=(6, 8))*.05
+    mo[np.ix_([0, 1], [1, 4])] += np.eye(2)
+    return left, right, mo
+
+
 class OverlapTests(unittest.TestCase):
+    def test_rectangular_cross_basis_against_determinants(self):
+        from nest.nttda.overlap_contraction import overlap_from_mo
+        for sector in (-1, 0):
+            left, right, mo = rectangular_pair(sector)
+            expected = np.array([[determinant_overlap(build_awf(left, i), build_awf(right, j), mo)
+                                  for j in range(3)] for i in range(4)])
+            np.testing.assert_allclose(overlap_from_mo(left, right, mo), expected, atol=1e-13, rtol=0)
+            np.testing.assert_allclose(overlap_from_mo(right, left, mo.conj().T), expected.conj().T,
+                                       atol=1e-13, rtol=0)
+
     def test_spin_purity_and_ms_invariance(self):
         rng = np.random.default_rng(43)
         rotation = rng.normal(size=(6, 6))*.03

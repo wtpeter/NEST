@@ -142,3 +142,18 @@ def test_gpu_contractions_against_displaced_determinants(solution):
         expected = np.array([[determinant_overlap(a, b, mo) for b in wf] for a in wf])
         np.testing.assert_allclose(actual, expected, atol=1e-12, rtol=0)
         np.testing.assert_allclose(actual, overlap_from_mo(cpu, cpu, mo), atol=1e-12, rtol=0)
+
+
+def test_rectangular_cuda_cubic_contractions(solution):
+    import cupy as cp
+    from nest.nttda.overlap_contraction import overlap_from_mo
+    from nest.nttda.overlap import build_awf, determinant_overlap
+    from nest.nttda.tests.test_overlap import rectangular_pair
+    for sector in (-1, 0):
+        left, right, mo = rectangular_pair(sector)
+        expected = np.array([[determinant_overlap(build_awf(left, i), build_awf(right, j), mo)
+                              for j in range(3)] for i in range(4)])
+        actual = cp.asnumpy(overlap_from_mo(left, right, cp.asarray(mo), xp=cp))
+        np.testing.assert_allclose(actual, expected, atol=1e-13, rtol=0)
+        reverse = cp.asnumpy(overlap_from_mo(right, left, cp.asarray(mo.conj().T), xp=cp))
+        np.testing.assert_allclose(reverse, expected.conj().T, atol=1e-13, rtol=0)

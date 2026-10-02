@@ -224,14 +224,20 @@ def wfoverlap(left, right, mo, directory, executable=None, memory_mb=8000):
 
 
 def overlap_matrix(previous, current, directory=None, backend='wfoverlap', ao_overlap=None, **kwargs):
-    """Cross-geometry root overlap in one spin sector, in energy/root order."""
+    """Cross-geometry/basis root overlap in one spin sector, in root order.
+
+    Both frames require the same closed/open electron counts; their virtual
+    spaces may differ. Cross-AO metrics include the basis change explicitly.
+    """
     if backend == 'gpu':
         import cupy as cp
         from nest.nttda.overlap_contraction import gpu_overlap_matrix
         # File-interface boundary: only the small root matrix returns to CPU.
         return cp.asnumpy(gpu_overlap_matrix(previous, current, ao_overlap=ao_overlap))
-    if previous.deltaS != current.deltaS or not np.array_equal(previous._scf.mo_occ, current._scf.mo_occ):
-        raise ValueError('Spin sector or reference occupations changed between steps')
+    if (previous.deltaS != current.deltaS
+            or any(np.count_nonzero(previous._scf.mo_occ == value)
+                   != np.count_nonzero(current._scf.mo_occ == value) for value in (1, 2))):
+        raise ValueError('Spin sector or reference electron count changed between frames')
     ao = ao_overlap if ao_overlap is not None else gto.intor_cross('int1e_ovlp', previous.mol, current.mol)
     mo = previous._scf.mo_coeff.conj().T @ ao @ current._scf.mo_coeff
     left = [build_awf(previous, i) for i in range(len(previous.xy))]

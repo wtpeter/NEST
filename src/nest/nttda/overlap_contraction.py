@@ -107,8 +107,14 @@ def _coefficients(td, xp):
         values = xp.zeros((len(x), math.prod(shape[1:])), dtype=x.dtype)
         # Coefficients stay on the device. Repeated destinations (e.g. CV(1)
         # and CV(0), or redundant OO trace) must be added, not overwritten.
-        xp.add.at(values, (slice(None), xp.asarray(target)),
-                  x[:, xp.asarray(origin)]*xp.asarray(weights)[None])
+        indices = slice(None), xp.asarray(target)
+        contributions = x[:, xp.asarray(origin)]*xp.asarray(weights)[None]
+        if values.dtype.kind == 'c':
+            # CuPy scatter-add has real atomics but no complex atomics.
+            xp.add.at(values.real, indices, contributions.real)
+            xp.add.at(values.imag, indices, contributions.imag)
+        else:
+            xp.add.at(values, indices, contributions)
         gram += values.conj().dot(values.T)
         groups[key] = values.reshape(shape)
     if np.max(abs(_host(gram, xp)-np.eye(len(x)))) > 1e-7:
@@ -229,7 +235,8 @@ def _network(nodes, xp, intermediates=None):
 def overlap_from_mo(previous, current, mo_overlap, xp=np):
     """Exact CPU/GPU contractions for one spin sector and a cross-MO metric.
 
-    For a fixed two-open-orbital reference and fixed number of roots, work
+    Virtual dimensions and occupation order may differ across the two bases;
+    their closed/open electron counts must match. For a fixed number of roots, work
     is O(N^3), storage O(N^2). A singular closed-core cross overlap is rejected
     rather than inverted unstably; the determinant backend remains an oracle.
     """
@@ -237,12 +244,16 @@ def overlap_from_mo(previous, current, mo_overlap, xp=np):
         raise ValueError('Spin sector changed between steps')
     left, occ_l, nc, nv = _coefficients(previous, xp)
     right, occ_r, nc_r, nv_r = _coefficients(current, xp)
-    if occ_l != occ_r or (nc, nv) != (nc_r, nv_r):
-        raise ValueError('Reference orbital partition changed between steps')
+    if nc != nc_r:
+        raise ValueError('Reference electron count changed between frames')
     mo = xp.asarray(mo_overlap)
-    closed = xp.asarray([i for i, occ in enumerate(occ_l) if occ == 2], dtype=xp.int64)
-    extra = xp.asarray([i for value in (1, 0) for i, occ in enumerate(occ_l) if occ == value], dtype=xp.int64)
-    d = mo[xp.ix_(closed, closed)]
+    if mo.shape != (len(occ_l), len(occ_r)):
+        raise ValueError('Cross-MO metric dimensions do not match the orbital spaces')
+    closed_l = xp.asarray([i for i, occ in enumerate(occ_l) if occ == 2], dtype=xp.int64)
+    closed_r = xp.asarray([i for i, occ in enumerate(occ_r) if occ == 2], dtype=xp.int64)
+    extra_l = xp.asarray([i for value in (1, 0) for i, occ in enumerate(occ_l) if occ == value], dtype=xp.int64)
+    extra_r = xp.asarray([i for value in (1, 0) for i, occ in enumerate(occ_r) if occ == value], dtype=xp.int64)
+    d = mo[xp.ix_(closed_l, closed_r)]
     if nc:
         singular = _host(xp.linalg.svd(d, compute_uv=False), xp)
         if singular.min() < 1e-8 or singular.max()/singular.min() > 1e8:
@@ -252,10 +263,10 @@ def overlap_from_mo(previous, current, mo_overlap, xp=np):
         prefactor = (sign*xp.exp(logarithm))**2
     else:
         inverse, prefactor = xp.zeros((0, 0)), xp.asarray(1.)
-    ce, ec = mo[xp.ix_(closed, extra)], mo[xp.ix_(extra, closed)]
+    ce, ec = mo[xp.ix_(closed_l, extra_r)], mo[xp.ix_(extra_l, closed_r)]
     r = inverse.dot(ce)
     l = ec.dot(inverse)
-    q = mo[xp.ix_(extra, extra)]-ec.dot(r)
+    q = mo[xp.ix_(extra_l, extra_r)]-ec.dot(r)
     matrices = dict(K=inverse, R=r, L=l, Q=q)
     views = {}
     def factor(description):
