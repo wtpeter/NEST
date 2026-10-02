@@ -93,10 +93,11 @@ def test_triplet_df_gradient_against_energy_fd(solution):
         np.testing.assert_allclose(actual[1, 0], fd[i], atol=1e-5, rtol=0)
 
 
-def test_shared_triplet_gradients_against_independent_drivers(solution):
+@pytest.mark.parametrize('backend', ['serial', 'batch'])
+def test_shared_triplet_gradients_against_independent_drivers(solution, backend):
     from nest.interfaces.sharc_nttda import _triplet_gradients
     _, triplet = solution
-    actual = _triplet_gradients(triplet)
+    actual = _triplet_gradients(triplet, backend=backend)
     expected = [triplet.Gradients().set(cphf_conv_tol=1e-10).kernel(state=i)
                 for i in (1, 2, 3)]
     np.testing.assert_allclose(actual, expected, atol=1e-10, rtol=0)

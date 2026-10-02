@@ -229,16 +229,51 @@ def _dipoles(td, triplet=None):
     return dm
 
 
-def _triplet_gradients(td, cphf_conv_tol=1e-10):
+def _triplet_gradients(td, cphf_conv_tol=1e-10, backend='serial'):
     """All NT-TDA triplet gradients with one geometry-local cache.
 
     The reference term is common to all roots; ``grad_elec`` supplies the
     excitation derivative using the public driver and its response cache.
     Never retain this driver after replacing orbitals or coordinates.
     """
+    if backend not in ('serial', 'batch'):
+        raise ValueError('triplet_gradient_backend must be serial or batch')
     driver = td.Gradients().set(cphf_conv_tol=cphf_conv_tol)
-    reference = driver.grad_nuc()
-    values = [reference+driver.grad_elec(xy) for xy in td.xy]
+    if backend == 'serial':
+        reference = driver.grad_nuc()
+        values = [reference+driver.grad_elec(xy) for xy in td.xy]
+    else:
+        # The fork's public compute_frame covers spin-flip gradients/NACs.
+        # Its channel preparations also allow same-spin gradient RHSs to
+        # share a solve without requesting unsupported same-spin NACs.
+        from dataclasses import replace
+        import cupy as cp
+        from gpu4pyscf.sftda import nttda_methods as methods
+        from gpu4pyscf.grad._nttda.response import finish_prepared_gradients
+
+        context = driver._context
+        atoms = tuple(range(td.mol.natm))
+        prepared = [methods.prepare_gradient(
+            context.method, driver, td, xy, atmlst=atoms,
+            tolerance=cphf_conv_tol, max_cycle=driver.cphf_max_cycle,
+            cache=context) for xy in td.xy]
+        if context.method.reference_kind == 'ensemble_roks':
+            pairs = methods.orbital_backend(context.method).canonical_pairs(td, compact=True)
+            reference_driver = td._scf.nuc_grad_method()
+            reference_driver.verbose = 0
+            reference_prepared = reference_driver.prepare_nttda_fusion(
+                pairs, atmlst=atoms, response_cache=context)
+            if reference_prepared.pairs != pairs:
+                raise RuntimeError('Selected-reference preparation changed orbital pair order')
+            prepared = [replace(item,
+                                orbital_rhs_shift=reference_prepared.orbital_rhs_shift,
+                                tolerance=min(float(cphf_conv_tol), 1e-12))
+                        for item in prepared]
+            reference = reference_prepared.unrelaxed_gradient
+        else:
+            reference = driver.grad_nuc()
+        components = finish_prepared_gradients(prepared)
+        values = [cp.asnumpy(cp.asarray(reference)+item.total) for item in components]
     if td.mol.symmetry:
         values = [driver.symmetrize(value) for value in values]
     return values
@@ -261,10 +296,12 @@ def run(qmin, config_path, output=None):
                'cphf_conv_tol', 'min_overlap', 'max_cycle', 'triplets', 'density_fit',
                'auxbasis', 'scf_diis_cycles', 'scf_newton_cycles', 'overlap_backend',
                'wfoverlap_executable', 'overlap_memory_mb', 'min_reference_overlap', 'initial_reference',
-               'reference_model'}
+               'reference_model', 'triplet_gradient_backend'}
     unknown = set(config)-allowed
     if unknown:
         raise ValueError(f'Unknown configuration keys: {sorted(unknown)}')
+    if config.get('triplet_gradient_backend', 'serial') not in ('serial', 'batch'):
+        raise ValueError('triplet_gradient_backend must be serial or batch')
     if config.get('overlap_backend', 'gpu') not in ('gpu', 'wfoverlap', 'python'):
         raise ValueError('overlap_backend must be gpu, wfoverlap or python')
     reference_model = config.get('reference_model', 'roks')
@@ -274,6 +311,8 @@ def run(qmin, config_path, output=None):
     triplet_mode = config.get('triplets', 'nttda')
     if triplet_mode not in ('nttda', 'reference') or (triplet_mode == 'reference' and ntriplets != 1):
         raise ValueError('triplets must be nttda or reference (requires one triplet)')
+    if triplet_mode == 'reference' and config.get('triplet_gradient_backend', 'serial') == 'batch':
+        raise ValueError('Batched triplet gradients require triplets=nttda')
     if triplet_mode == 'nttda' and 'nacdr' in requests:
         raise NotImplementedError('Excited triplet dynamics requires SHARC coupling overlap; deltaS=0 NAC is unavailable')
     if reference_model == 'ensemble_roks' and triplet_mode != 'nttda':
@@ -406,7 +445,9 @@ def run(qmin, config_path, output=None):
         if triplet is None:
             triplet_grads = [td.Gradients().kernel(state=0)]
         else:
-            triplet_grads = _triplet_gradients(triplet, config.get('cphf_conv_tol', 1e-10))
+            triplet_grads = _triplet_gradients(
+                triplet, config.get('cphf_conv_tol', 1e-10),
+                backend=config.get('triplet_gradient_backend', 'serial'))
         timed_stage('triplet_gradients')
         grad = np.array([frame['gradients'][i] for i in range(1, nroots+1)] + triplet_grads*3)
         nac = np.zeros((dimension, dimension, mol.natm, 3))

@@ -135,3 +135,32 @@ def test_ensemble_bridge_keeps_selected_energy_zero(solution):
     np.testing.assert_allclose(carrier._scf.e_tot, expected, atol=1e-9, rtol=0)
     np.testing.assert_allclose(_snapshot(td)['e_tot'], expected, atol=1e-9, rtol=0)
     np.testing.assert_allclose(carrier._scf.e_tot + carrier.e, td.e_tot, atol=1e-12, rtol=0)
+
+
+@pytest.mark.parametrize('ensemble', [False, True])
+def test_triplet_gradient_batch_against_serial_and_cpu(solution, ensemble):
+    import cupy as cp
+    from gpu4pyscf.sftda import EnsembleROKS, NTTDA_EnsembleROKS, NTTDA_ROKS
+    from nest.interfaces.sharc_nttda import _triplet_gradients
+    from nest.soc.gpu_nttda import to_nest
+    if ensemble:
+        mf = EnsembleROKS(solution.mol.copy(), xc='PBE').set(
+            conv_tol=1e-12, conv_tol_grad=1e-8)
+        mf.grids.level = 0
+        mf.small_rho_cutoff = 0
+        mf.run()
+        cls = NTTDA_EnsembleROKS
+    else:
+        mf, cls = solution._scf, NTTDA_ROKS
+    assert mf.converged
+    td = cls(mf).set(deltaS=0, nstates=3, conv_tol=1e-10, max_cycle=200).run()
+    assert np.all(td.converged)
+    serial = np.asarray(_triplet_gradients(td, backend='serial'))
+    batch = np.asarray(_triplet_gradients(td, backend='batch'))
+    np.testing.assert_allclose(batch, serial, atol=1e-8, rtol=0)
+    if not ensemble:
+        cpu = to_nest(td)
+        cpu._scf.grids.coords = cp.asnumpy(mf.grids.coords)
+        cpu._scf.grids.weights = cp.asnumpy(mf.grids.weights)
+        expected = np.array([cpu.Gradients().kernel(state=i) for i in (1, 2, 3)])
+        np.testing.assert_allclose(batch, expected, atol=1e-7, rtol=0)

@@ -128,6 +128,15 @@ and the singlet/triplet overlap singular values. Times synchronize CUDA and
 include first-call setup in that Python process. All triplet gradients reuse
 one geometry-local response cache and one common reference gradient.
 
+`triplet_gradient_backend: "serial"` preserves the default triplet gradient
+path. The optional `"batch"` backend prepares the same-spin gradient right-hand
+sides with the installed NT-TDA fork and shares their orbital response solve.
+For EnsembleROKS it fuses the selected-reference response into each gradient,
+using the same high-spin energy zero. This does not enable triplet NACs.
+Use a fresh savedir when changing this setting. Small ordinary/ensemble
+regressions and a 2-thiouracil three-triplet comparison validate the optional
+backend; measure first-call and repeated-call costs on the target system.
+
 Validated: real restricted molecular ROKS with exactly two open orbitals,
 deltaS=-1/0, DF gradients, phase covariance and small overlap SOC trajectories.
 The ensemble option has a selected-energy-zero regression against an
