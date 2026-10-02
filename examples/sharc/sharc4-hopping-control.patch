@@ -1,0 +1,47 @@
+--- a/source/input.F90
++++ b/source/input.F90
+@@ -1380,6 +1380,10 @@
+ 
+     ! initialize time uncertainty
+     ctrl%time_uncertainty=0
++    ! Standard dynamics must enter the ordinary hopping/switching branch.
++    ! This optional control was otherwise left undefined, which can silently
++    ! skip both branches in integrators.f90.
++    ctrl%army_ants=0
+   
+     ! do time uncertainty or not
+     line=get_value_from_key('time_uncertainty',io)
+--- a/source/restart.f90
++++ b/source/restart.f90
+@@ -180,7 +180,7 @@
+      write(u,*) ctrl%boltzmann_temperature
+      write(u,*) ctrl%boltzmann_damping
+      write(u,*) ctrl%switching_procedure
+-     write(u,*) ctrl%army_ants
++     write(u,*) ctrl%army_ants, '! army_ants'
+  
+      ! thermostat
+      write(u,*) ctrl%thermostat, '! thermostat'
+@@ -797,6 +797,10 @@
+      read(u_ctrl,*) ctrl%laser_b
+      read(u_ctrl,*) ctrl%laser_egrad
+      read(u_ctrl,*) ctrl%laser_freq_path
++     ! calc_dipole is not stored in the legacy restart format. Reconstruct
++     ! the same mode selected by input.F90 instead of using an undefined flag.
++     ctrl%calc_dipole=1
++     if (ctrl%laser/=0 .and. (ctrl%laser_b .or. ctrl%laser_egrad)) ctrl%calc_dipole=2
+      read(u_ctrl,*) ctrl%coupling
+      read(u_ctrl,*) ctrl%ktdc_method
+      read(u_ctrl,*) ctrl%kmatrix_method
+@@ -857,6 +861,11 @@
+      read(u_ctrl,*) ctrl%boltzmann_damping
+      read(u_ctrl,*) ctrl%switching_procedure
+      read(u_ctrl,*) ctrl%army_ants
++     if (ctrl%army_ants/=0 .and. ctrl%army_ants/=1) then
++       write(0,*) 'Invalid army_ants control in restart: ',ctrl%army_ants
++       write(0,*) 'This checkpoint may have skipped surface hopping; do not silently resume it.'
++       stop 1
++     endif
+      
+      ! thermostat
+      if (printlevel>3) write(u_log,*) 'Reading restart file, Section 6 ...'

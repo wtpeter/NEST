@@ -1,7 +1,8 @@
 # GPU NT-TDA / NEST SOC / SHARC overlap example
 
 Run on a CUDA worker with the gpu4pyscf NT-TDA branch, editable NEST, and
-compiled SHARC + WFoverlap. Copy `input`, `geom`, `veloc` into a new trajectory
+compiled SHARC (WFoverlap is optional for the external oracle backend).
+Copy `input`, `geom`, `veloc` into a new trajectory
 and `runQM.sh`, `nttda.json` into its `QM/` subdirectory. Activate the Python
 and SHARC environment, then run `sharc.x input` in the trajectory directory.
 SHARC invokes `QM/runQM.sh` with `/bin/sh`. Generated trajectories, logs and
@@ -16,6 +17,37 @@ checks; they are not suitable convergence settings for production dynamics.
 Use `select_directly`: the adapter evaluates all requested states' gradients
 and caches the result, rather than implementing SHARC's gradient-selection
 subsequent-call protocol.
+
+Some SHARC4 sources leave `ctrl%army_ants` uninitialized. The integrator only
+evaluates hopping when this flag is 0 or 1; another integer silently skips both
+hopping branches while the trajectory can finish normally. The accompanying
+`sharc4-hopping-control.patch` initializes ordinary dynamics to 0 and explicitly
+rejects invalid restart values. Apply it only to affected sources, rebuild the
+`sharc` target, and install the new binary atomically. From the workspace:
+
+```bash
+patch -d src/sharc4 -p1 < src/NEST/examples/sharc/sharc4-hopping-control.patch
+make -C src/sharc4/source -j4 sharc
+install -m755 src/sharc4/source/sharc1.x src/sharc4/bin/sharc.x.next
+mv src/sharc4/bin/sharc.x.next src/sharc4/bin/sharc.x
+envs/nttda/bin/python src/NEST/examples/sharc/validate_hopping_control.py \
+  --sharc src/sharc4/bin/sharc.x --output files/verification/sharc-hopping-control
+```
+
+The CPU synthetic regression checks 3S3T/5S3T/6S3T initialization, nonzero
+random draws/hopping probabilities, and rejection of a corrupted restart flag.
+It also checks that a valid restart requests dipoles. Legacy restart files do
+not store `calc_dipole`; the patch reconstructs the ordinary dipole mode, or
+the higher-multipole mode selected by saved laser flags, without changing the
+positional restart format. An undefined value can omit `DM` from `QM.in` while
+the engine attempts to read dipoles and fails.
+It does not validate molecular energies, forces, SOC or physical yields.
+Audit existing `restart.ctrl` files before interpreting affected runs; the
+`army_ants` value is five lines after the `! hopping_procedure` marker. Invalid
+runs must be recalculated from their initial conditions. Resetting their flag
+cannot recover omitted hopping. Independent runs can also return opposite AWF
+signs: align SOC/dipole matrices using same-frame AWF overlaps, and align both
+endpoints when comparing cross-step overlaps or restart results.
 
 The interface is `nest.interfaces.sharc_nttda`. Set SHARC's
 `nstates Ns 0 Nt`; both Ns and Nt must be positive. For a closed-shell molecule,
