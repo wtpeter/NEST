@@ -45,6 +45,32 @@ def test_bridge_against_independent_nest_solver(solution):
     np.testing.assert_allclose(actual.h_soc, actual.h_soc.conj().T, atol=1e-13)
 
 
+def test_bridge_freezes_geometry_and_electronic_solution(solution):
+    import copy
+    import cupy as cp
+    from nest.soc.gpu_nttda import to_nest
+    moving = copy.copy(solution)
+    moving._scf = copy.copy(solution._scf)
+    moving.mol = solution.mol.copy()
+    moving._scf.mol = moving.mol
+    moving._scf.mo_coeff = solution._scf.mo_coeff.copy()
+    moving.xy = [(x.copy(), y) for x, y in solution.xy]
+    carrier = to_nest(moving)
+    original_coords = moving.mol.atom_coords()
+    original_coeff = cp.asnumpy(moving._scf.mo_coeff)
+    original_x = cp.asnumpy(moving.xy[0][0])
+    assert carrier.mol is carrier._scf.mol
+    assert carrier.mol is not moving.mol
+    displaced = original_coords.copy()
+    displaced[1, 0] += .1
+    moving.mol.set_geom_(displaced, unit='Bohr', inplace=True)
+    moving._scf.mo_coeff[:] = 0
+    moving.xy[0][0][:] = 0
+    np.testing.assert_array_equal(carrier.mol.atom_coords(), original_coords)
+    np.testing.assert_array_equal(carrier._scf.mo_coeff, original_coeff)
+    np.testing.assert_array_equal(carrier.xy[0][0], original_x)
+
+
 def test_all_gpu_gradients_against_nest(solution):
     import cupy as cp
     from gpu4pyscf.grad.nttda import compute_frame

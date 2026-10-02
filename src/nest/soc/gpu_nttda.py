@@ -26,7 +26,9 @@ def to_nest(td):
         raise ValueError('SCF and all NT-TDA roots must be converged before SOC')
     if td.deltaS not in (-1, 0, 1):
         raise ValueError('Unsupported NT-TDA spin channel')
-    mf = dft.ROKS(td.mol)
+    # Geometry scanners may mutate their Mole in place between calls. Keep
+    # the copied orbitals paired with the geometry at which they were solved.
+    mf = dft.ROKS(td.mol.copy())
     mf.xc = td._scf.xc
     mf.mo_coeff = host(td._scf.mo_coeff)
     mf.mo_occ = host(td._scf.mo_occ)
