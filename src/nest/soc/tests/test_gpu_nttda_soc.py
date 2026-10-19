@@ -137,8 +137,9 @@ def test_ensemble_bridge_keeps_selected_energy_zero(solution):
     np.testing.assert_allclose(carrier._scf.e_tot + carrier.e, td.e_tot, atol=1e-12, rtol=0)
 
 
-@pytest.mark.parametrize('ensemble', [False, True])
-def test_triplet_gradient_batch_against_serial_and_cpu(solution, ensemble):
+@pytest.mark.parametrize('ensemble,density_fit', [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize('cphf_max_cycle', [None, 200])
+def test_triplet_gradient_batch_against_serial_and_cpu(solution, ensemble, density_fit, cphf_max_cycle):
     import cupy as cp
     from gpu4pyscf.sftda import EnsembleROKS, NTTDA_EnsembleROKS, NTTDA_ROKS
     from nest.interfaces.sharc_nttda import _triplet_gradients
@@ -146,6 +147,8 @@ def test_triplet_gradient_batch_against_serial_and_cpu(solution, ensemble):
     if ensemble:
         mf = EnsembleROKS(solution.mol.copy(), xc='PBE').set(
             conv_tol=1e-12, conv_tol_grad=1e-8)
+        if density_fit:
+            mf = mf.density_fit(auxbasis='def2-universal-jkfit')
         mf.grids.level = 0
         mf.small_rho_cutoff = 0
         mf.run()
@@ -155,8 +158,8 @@ def test_triplet_gradient_batch_against_serial_and_cpu(solution, ensemble):
     assert mf.converged
     td = cls(mf).set(deltaS=0, nstates=3, conv_tol=1e-10, max_cycle=200).run()
     assert np.all(td.converged)
-    serial = np.asarray(_triplet_gradients(td, backend='serial'))
-    batch = np.asarray(_triplet_gradients(td, backend='batch'))
+    serial = np.asarray(_triplet_gradients(td, backend='serial', cphf_max_cycle=cphf_max_cycle))
+    batch = np.asarray(_triplet_gradients(td, backend='batch', cphf_max_cycle=cphf_max_cycle))
     np.testing.assert_allclose(batch, serial, atol=1e-8, rtol=0)
     if not ensemble:
         cpu = to_nest(td)

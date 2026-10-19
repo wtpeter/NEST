@@ -11,6 +11,7 @@ import itertools
 import json
 from pathlib import Path
 import time
+import warnings
 
 import numpy as np
 from pyscf import gto
@@ -229,7 +230,7 @@ def _dipoles(td, triplet=None):
     return dm
 
 
-def _triplet_gradients(td, cphf_conv_tol=1e-10, backend='serial'):
+def _triplet_gradients(td, cphf_conv_tol=1e-10, backend='serial', cphf_max_cycle=None):
     """All NT-TDA triplet gradients with one geometry-local cache.
 
     The reference term is common to all roots; ``grad_elec`` supplies the
@@ -238,9 +239,19 @@ def _triplet_gradients(td, cphf_conv_tol=1e-10, backend='serial'):
     """
     if backend not in ('serial', 'batch'):
         raise ValueError('triplet_gradient_backend must be serial or batch')
-    driver = td.Gradients().set(cphf_conv_tol=cphf_conv_tol)
+    driver = td.Gradients().set(cphf_conv_tol=cphf_conv_tol,
+                                cphf_max_cycle=cphf_max_cycle)
     if backend == 'serial':
-        reference = driver.grad_nuc()
+        if cphf_max_cycle is not None and driver._context.method.reference_kind == 'ensemble_roks':
+            # The standalone selected-reference solve has its own iteration
+            # limit; the public NT-TDA driver does not forward this option.
+            reference_driver = td._scf.nuc_grad_method().set(max_cycle=cphf_max_cycle)
+            reference_driver.verbose = 0
+            if driver._with_df:
+                reference_driver.nttda_xc_backend = driver._context.xc_backend
+            reference = reference_driver.kernel()
+        else:
+            reference = driver.grad_nuc()
         values = [reference+driver.grad_elec(xy) for xy in td.xy]
     else:
         # The fork's public compute_frame covers spin-flip gradients/NACs.
@@ -293,13 +304,16 @@ def run(qmin, config_path, output=None):
     atoms, requests, nroots, charge, unit = read_qmin(qmin)
     config = json.loads(Path(config_path).read_text())
     allowed = {'basis', 'xc', 'grid_level', 'soctype', 'scf_conv_tol', 'scf_conv_tol_grad', 'td_conv_tol',
-               'cphf_conv_tol', 'min_overlap', 'max_cycle', 'triplets', 'density_fit',
+               'cphf_conv_tol', 'cphf_max_cycle', 'min_overlap', 'max_cycle', 'triplets', 'density_fit',
                'auxbasis', 'scf_diis_cycles', 'scf_newton_cycles', 'overlap_backend',
                'wfoverlap_executable', 'overlap_memory_mb', 'min_reference_overlap', 'initial_reference',
-               'reference_model', 'triplet_gradient_backend'}
+               'reference_model', 'triplet_gradient_backend', 'reference_overlap_action'}
     unknown = set(config)-allowed
     if unknown:
         raise ValueError(f'Unknown configuration keys: {sorted(unknown)}')
+    reference_overlap_action = config.get('reference_overlap_action', 'stop')
+    if reference_overlap_action not in ('stop', 'warn'):
+        raise ValueError('reference_overlap_action must be stop or warn')
     if config.get('triplet_gradient_backend', 'serial') not in ('serial', 'batch'):
         raise ValueError('triplet_gradient_backend must be serial or batch')
     if config.get('overlap_backend', 'gpu') not in ('gpu', 'wfoverlap', 'python'):
@@ -406,7 +420,12 @@ def run(qmin, config_path, output=None):
             diagnostics['reference_overlap'] = float(reference_value)
             print(f'Step {step}: reference overlap {reference_value:.10f}', flush=True)
             if abs(reference_value) < config.get('min_reference_overlap', 0.9):
-                raise RuntimeError(f'{reference_model} reference changed discontinuously; inspect the orbital branch and reference model')
+                message = (f'{reference_model} reference changed discontinuously '
+                           f'(overlap={reference_value:.10f}); inspect the orbital branch and reference model')
+                if reference_overlap_action == 'stop':
+                    raise RuntimeError(message)
+                diagnostics['reference_overlap_warning'] = message
+                warnings.warn(message, RuntimeWarning)
         triplet = (td_class(mf).set(deltaS=0, nstates=ntriplets,
                                     conv_tol=config.get('td_conv_tol', 1e-10),
                                     max_cycle=config.get('max_cycle', 200)).run()
@@ -440,14 +459,16 @@ def run(qmin, config_path, output=None):
         phases = np.where(diagonal < 0, -1.0, 1.0)
         pairs = list(itertools.combinations(range(1, nroots+1), 2)) if 'nacdr' in requests else []
         frame = compute_frame(td, 1, pairs, gradient_states=list(range(1, nroots+1)),
-                              use_etfs=False, cphf_conv_tol=config.get('cphf_conv_tol', 1e-10))
+                              use_etfs=False, cphf_conv_tol=config.get('cphf_conv_tol', 1e-10),
+                              cphf_max_cycle=config.get('cphf_max_cycle'))
         timed_stage('singlet_gradients')
         if triplet is None:
             triplet_grads = [td.Gradients().kernel(state=0)]
         else:
             triplet_grads = _triplet_gradients(
                 triplet, config.get('cphf_conv_tol', 1e-10),
-                backend=config.get('triplet_gradient_backend', 'serial'))
+                backend=config.get('triplet_gradient_backend', 'serial'),
+                cphf_max_cycle=config.get('cphf_max_cycle'))
         timed_stage('triplet_gradients')
         grad = np.array([frame['gradients'][i] for i in range(1, nroots+1)] + triplet_grads*3)
         nac = np.zeros((dimension, dimension, mol.natm, 3))

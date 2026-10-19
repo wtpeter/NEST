@@ -132,6 +132,11 @@ nt = roks.NTTDA()
 
 See [`examples`](examples) for complete calculations.
 
+For GPU NT-TDA molecular dynamics with NEST SOC and SHARC, see the
+[installation and trajectory example](examples/sharc/README.md). It specifies
+the compatible gpu4pyscf fork/revision, SHARC control fixes, and a small
+singlet/triplet overlap-coupling run.
+
 ## License
 
 NEST is released under the Apache License 2.0.
