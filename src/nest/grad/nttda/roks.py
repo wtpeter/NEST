@@ -17,8 +17,9 @@
 from dataclasses import dataclass
 
 import numpy as np
+from scipy.sparse.linalg import LinearOperator, gmres
 
-from pyscf import dft, lib
+from pyscf import dft
 from pyscf.grad import rhf as rhf_grad
 from nest.aocscf import AverageOccupationROKS, SymAdaptedAverageOccupationROKS
 
@@ -214,26 +215,32 @@ def _preconditioner(tdobj, pairs):
 
 
 def _solve_zvector(action, diagonal, rhs, tolerance=1e-12, max_cycle=None):
-    """Shared preconditioned Krylov solve, with a reference-specific diagonal."""
-    initial = rhs / diagonal
+    """Solve the adjoint equation with a true-residual convergence check."""
     if max_cycle is None:
         max_cycle = len(rhs)
-
-    def operator(vector):
-        vector = np.asarray(vector)
-        if vector.ndim == 1:
-            return action(vector) / diagonal - vector
-        return np.asarray([action(row) / diagonal - row for row in vector])
-
-    solution = lib.krylov(
-        operator,
-        initial,
-        tol=tolerance,
-        max_cycle=max_cycle,
-        lindep=1e-22,
-        hermi=False,
-        verbose=0,
+    operator = LinearOperator(
+        (rhs.size, rhs.size), matvec=action, dtype=rhs.dtype,
     )
+    preconditioner = LinearOperator(
+        operator.shape, matvec=lambda vector: vector / diagonal, dtype=rhs.dtype,
+    )
+    residuals = []
+    common = dict(
+        A=operator, b=rhs, M=preconditioner,
+        restart=min(40, rhs.size), maxiter=max_cycle,
+        # Count inner iterations, matching the existing max_cycle argument.
+        callback=residuals.append, callback_type="legacy",
+    )
+    try:
+        solution, info = gmres(rtol=0.0, atol=tolerance, **common)
+    except TypeError:  # SciPy < 1.12 compatibility
+        solution, info = gmres(tol=0.0, atol=tolerance, **common)
+    if info != 0:
+        residual = np.linalg.norm(action(solution) - rhs)
+        raise RuntimeError(
+            "NTTDA Z-vector GMRES failed after %d iterations: residual=%.3g, tolerance=%.3g"
+            % (len(residuals), residual, tolerance)
+        )
     return np.asarray(solution).reshape(-1)
 
 def solve_zvector(action, pairs, tdobj, rhs, tolerance=1e-12, max_cycle=None):
