@@ -150,6 +150,13 @@ class Gradients(rhf_grad.GradientsBase):
         return lib.set_class(TDSCF_GradScanner(self, state),
                              (TDSCF_GradScanner, self.__class__), name)
 
+    def to_gpu(self):
+        from nest.gpu.grad.nttda import Gradients
+        return Gradients.from_cpu(self)
+
+    def to_cpu(self):
+        return self
+
     def dump_flags(self, verbose=None):
         log = logger.new_logger(self, verbose)
         log.info("******** NTTDA nuclear gradients ********")

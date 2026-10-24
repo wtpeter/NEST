@@ -975,6 +975,18 @@ class NTTDA(TDBase):
 
     Gradients = nuc_grad_method
 
+    def to_gpu(self):
+        from nest.aocscf import AverageOccupationROKS, SymAdaptedAverageOccupationROKS
+        if isinstance(self._scf, (AverageOccupationROKS, SymAdaptedAverageOccupationROKS)):
+            raise NotImplementedError('GPU NTTDA does not support AOCSCF references')
+        import cupy as cp
+        from nest.gpu.nttda import NTTDA as GPUNTTDA
+
+        out = lib.to_gpu(self, out=GPUNTTDA(self._scf.to_gpu()))
+        if out.xy is not None:
+            out.xy = [(cp.asarray(x), y) for x, y in out.xy]
+        return out
+
     def dump_flags(self, verbose=None):
         TDBase.dump_flags(self, verbose)
         log = logger.new_logger(self, verbose)
