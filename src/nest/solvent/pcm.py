@@ -14,7 +14,7 @@
 
 """State-specific PCM with fixed reference orbitals and a fixed TDA kernel.
 
-The variational model is G[x] = E_ref + x.T A_gas x + E_PCM[D[x]].
+The variational model is G[x] = E_ref + x.T A_vacuum x + E_PCM[D[x]].
 Only the physical state's amplitudes and the reaction field are iterated.
 Vertical ptSS energies use the quadratic fast-polarization correction
     1/2 (D_k - D_A) : B(eps_optical) : (D_k - D_A)
@@ -26,12 +26,19 @@ from pyscf import lib, scf
 from pyscf.lib import logger
 from pyscf.solvent import pcm
 
+from nest._lr_eig import eigh
 from nest.nttda.nttda import NTTDA, _orbital_indices, _sc_vector_slices, transition_dm
 from nest.sftda.uhf_sf import TDA_SF, TDDFT_SF
 
 
 class _FrozenFieldTDA:
-    """TDA results in a fixed reaction field, with energy-only capabilities."""
+    """Mixin marking a result from one fixed-field solve.
+
+    ``_solve`` attaches this before the original TDA class and installs the
+    combined matrix-vector product. The outer PCM loop may update the field
+    between solves. These overrides limit inherited derivative/matrix APIs
+    to the capabilities implemented for the solvent model.
+    """
 
     def nuc_grad_method(self):
         raise NotImplementedError('Physical-state PCM gradients are not implemented.')
@@ -60,9 +67,9 @@ def _validate_td(td):
             or any(cls.__module__.startswith('nest.dz0scf') for cls in type(mf).__mro__)):
         raise TypeError('Use an ordinary UKS/UHF or ROKS/ROHF reference.')
     if getattr(mf, 'with_solvent', None) is not None:
-        raise ValueError('Start from a gas-phase reference; StateSpecificPCM supplies the physical-state reaction field.')
+        raise ValueError('Start from a vacuum reference; StateSpecificPCM supplies the physical-state reaction field.')
     if not mf.converged:
-        raise ValueError('Converge the gas-phase reference before constructing StateSpecificPCM.')
+        raise ValueError('Converge the vacuum reference before constructing StateSpecificPCM.')
     if np.iscomplexobj(mf.mo_coeff):
         raise NotImplementedError('StateSpecificPCM currently supports real reference orbitals.')
     if isinstance(td, NTTDA) and td.deltaS not in (-1, 0, 1):
@@ -82,10 +89,8 @@ def state_density(td, state=1):
     occupation. It is not an orbital-relaxed energy-derivative density.
     """
     _validate_td(td)
-    if not isinstance(state, (int, np.integer)) or not 1 <= state <= len(td.xy):
-        raise ValueError('state must index a computed root (1-based).')
     x, y = td.xy[state - 1]
-    if np.any(y) or not np.isclose(np.vdot(x, x).real, 1.0, atol=1e-8, rtol=0):
+    if np.any(y):
         raise ValueError('A normalized TDA amplitude with Y=0 is required.')
     return _transition_density(td, state - 1, state - 1)
 
@@ -216,11 +221,19 @@ class StateSpecificPCM(lib.StreamObject):
     """Equilibrate PCM with a physical SF/NT root, then compute vertical ptSS gaps.
 
     Args:
-        td: Gas-phase SF-TDA or NT-TDA object, with the desired number of roots.
+        td: Vacuum SF-TDA or NT-TDA template, with the desired number of roots.
+            Its SCF reference must be converged. The TDA kernel is run here;
+            precomputed TDA amplitudes are optional and are recomputed.
         solvent: A PySCF C-PCM object on the same molecule. It is copied.
         eps_optical: Optical dielectric constant (squared refractive index).
 
-    ``kernel(state=1)`` returns the equilibrium total model energy of the
+    ``base`` stores a copy of the input template, sharing its SCF reference.
+    ``gas_td`` stores the initial vacuum spectrum (historical field name).
+    ``td`` stores the most recent fixed-field result; ``ss_td`` stores the
+    final target-field result from non-equilibrium SS. Their eigenvalues
+    are fixed-field quantities; use this driver's returned energies/gaps.
+
+    ``kernel(state=1)`` performs equilibrium SS and returns the total model energy of the
     selected physical root. ``vertical()`` returns ptSS energy gaps from that
     root. Both use Hartree. A different spin sector on the *same SCF object*
     may be supplied to ``vertical(td)``. Results are stored in ``td`` (frozen
@@ -228,16 +241,22 @@ class StateSpecificPCM(lib.StreamObject):
     ``state_specific(state, td=None)`` relaxes one target in the source's
     fixed slow-polarization environment and returns its SS gap. Set
     ``diis_space=6`` to accelerate either outer loop; the default 0 uses
-    direct iteration.
+    direct iteration. DIIS uses the fixed-point residual D_out - D_in.
 
-    Each geometry requires a new driver and converged gas-phase reference.
+    Both SS loops select the energy-ordered ``state`` at every iteration.
+    Set ``follow_state=True`` on either call to track a root by amplitude
+    overlap instead, for example when following a CT state through crossings.
+    ``vertical(method='ptlr')`` is an experimental isolated-root response
+    approximation within the fixed-orbital model.
+
+    Each geometry requires a new driver and converged vacuum reference.
     Gradients, TDDFT X/Y amplitudes and orbital relaxation are not implemented.
     """
 
     def __init__(self, td, solvent, *, eps_optical):
         _validate_td(td)
         if isinstance(td, _FrozenFieldTDA):
-            raise ValueError('Supply a gas-phase TDA object, not a frozen-field result.')
+            raise ValueError('Supply a vacuum TDA object, not a frozen-field result.')
         if type(solvent) is not pcm.PCM or solvent.method.upper() not in ('C-PCM', 'CPCM'):
             raise TypeError('The initial implementation requires a PySCF C-PCM object.')
         if solvent.mol is not td.mol:
@@ -277,83 +296,100 @@ class StateSpecificPCM(lib.StreamObject):
         self.ss_history = []
         dm_ref = np.asarray(td._scf.make_rdm1())
         self._dm_ref = dm_ref.sum(axis=0) if dm_ref.ndim == 3 else dm_ref
-        self._gas_response = self._build_response(self.base)
+        self._vacuum_response = self._build_response(self.base)
 
     def _build_response(self, td):
         if isinstance(td, NTTDA):
             return {-1: td.gen_vind_sfd, 0: td.gen_vind_sc, 1: td.gen_vind_sfu}[td.deltaS]()
         return td.gen_vind()
 
-    def _solve(self, template, gas_response, potential, x0=None):
-        gas_vind, gas_diag = gas_response
-        solvent_vind, solvent_diag = _potential_action(template, potential)
+    def _solve(self, vacuum_td, vacuum_response, potential, x0=None):
+        """Solve in one fixed reaction field; retain the original amplitude layout."""
+        vacuum_vind, vacuum_diag = vacuum_response
+        solvent_vind, solvent_diag = _potential_action(vacuum_td, potential)
+        diagonal = vacuum_diag + solvent_diag
+        base_precond = vacuum_td.get_precond(diagonal)
+        nt_down = isinstance(vacuum_td, NTTDA) and vacuum_td.deltaS == -1
+        nroots = min(vacuum_td.nstates, len(diagonal) - int(nt_down))
+        if nt_down:
+            cs, os, vs = _orbital_indices(vacuum_td)
+            ncs, nos, nvs = len(cs), len(os), len(vs)
+            open_diag = np.arange(nos)
 
-        def vind(z):
-            return gas_vind(z) + solvent_vind(z)
+            def project(z):
+                # Match NTTDA.kernel on main: remove the OO identity direction.
+                projected = np.array(z, copy=True)
+                oo = projected.reshape(-1, ncs + nos, nos + nvs)[:, ncs:, :nos]
+                trace = np.trace(oo, axis1=1, axis2=2) / nos
+                oo[:, open_diag, open_diag] -= trace[:, None]
+                return projected
 
-        td = lib.set_class(template.copy(), (_FrozenFieldTDA, template.__class__))
-        td.chkfile = None
-        diagonal = gas_diag + solvent_diag
-        nt_down = isinstance(td, NTTDA) and td.deltaS == -1
-        nroots = min(td.nstates + int(nt_down), len(diagonal))
+            def vind(z):
+                z = project(z)
+                return project(vacuum_vind(z) + solvent_vind(z))
+
+            def precond(residual, energy):
+                # Diagonal preconditioning can reintroduce the OO trace.
+                return project(base_precond(residual, energy))
+        else:
+            def vind(z):
+                return vacuum_vind(z) + solvent_vind(z)
+
+            precond = base_precond
+
         indices = np.argsort(diagonal)[:min(nroots + 3, len(diagonal))]
         guesses = np.zeros((len(indices), len(diagonal)))
         guesses[np.arange(len(indices)), indices] = 1
         if x0 is not None:
-            guesses = np.asarray(x0)
-            if nt_down:
-                cs, os, vs = _orbital_indices(td)
-                rotation = np.zeros((len(cs) + len(os), len(os) + len(vs)))
-                rotation[len(cs) + np.arange(len(os)), np.arange(len(os))] = 1 / np.sqrt(len(os))
-                guesses = np.vstack((guesses, rotation.ravel()))
-            if len(guesses) < nroots:
-                extra = np.zeros((len(indices), len(diagonal)))
-                extra[np.arange(len(indices)), indices] = 1
-                guesses = np.vstack((guesses, extra))
-        # PySCF's Hermitian Davidson handles repeated, nearly converged starts.
-        # Set its residual and dependency thresholds consistently with the
-        # accuracy needed by the density outer iteration.
-        tolerance = min(td.conv_tol, self.conv_tol_dm * 0.01)
-        converged, energies, vectors = lib.davidson1(
-            vind, guesses, td.get_precond(diagonal), nroots=nroots,
-            tol=1e-12, tol_residual=tolerance, lindep=min(td.lindep, tolerance**2 * 0.01),
-            max_cycle=td.max_cycle, max_space=max(20, 4*nroots),
-            max_memory=td.max_memory, verbose=logger.new_logger(td))
-        energies, vectors, converged = np.asarray(energies), np.asarray(vectors), np.asarray(converged)
+            # Keep diagonal guesses as well: a previously converged root can
+            # miss a newly lower state in another invariant subspace.
+            guesses = np.vstack((x0, guesses))
         if nt_down:
-            cs, os, vs = _orbital_indices(td)
-            rotation = np.zeros((len(cs) + len(os), len(os) + len(vs)))
-            rotation[len(cs) + np.arange(len(os)), np.arange(len(os))] = 1 / np.sqrt(len(os))
-            keep = abs(vectors @ rotation.ravel()) < 1 - 1e-6
-            energies, vectors, converged = energies[keep], vectors[keep], converged[keep]
-        td.e, td.converged = energies[:td.nstates], converged[:td.nstates]
-        if isinstance(td, NTTDA):
-            cs, os, vs = _orbital_indices(td)
+            guesses = project(guesses)
+
+        def all_eigs(w, v, nroots, envs):
+            return w, v, np.arange(w.size)
+
+        tolerance = min(vacuum_td.conv_tol, self.conv_tol_dm * 0.01)
+        converged, energies, vectors = eigh(
+            vind, guesses, precond, nroots=nroots, pick=all_eigs,
+            tol_residual=tolerance, lindep=min(vacuum_td.lindep, tolerance**2 * 0.01),
+            max_cycle=vacuum_td.max_cycle, max_memory=vacuum_td.max_memory,
+            verbose=logger.new_logger(vacuum_td))
+        field_td = lib.set_class(vacuum_td.copy(), (_FrozenFieldTDA, vacuum_td.__class__))
+        field_td.chkfile = None
+        field_td.e, field_td.converged = np.asarray(energies), np.asarray(converged)
+        field_td.nstates = len(energies)
+        if isinstance(vacuum_td, NTTDA):
+            cs, os, vs = _orbital_indices(vacuum_td)
             shape = {-1: (len(cs)+len(os), len(os)+len(vs)), 0: (len(diagonal),),
-                     1: (len(cs), len(vs))}[td.deltaS]
+                     1: (len(cs), len(vs))}[vacuum_td.deltaS]
         else:
-            so, sv = (1, 0) if td.extype == 0 else (0, 1)
-            shape = (np.count_nonzero(td._scf.mo_occ[so]), np.count_nonzero(td._scf.mo_occ[sv] == 0))
-        td.xy = [(x.reshape(shape), 0) for x in vectors[:td.nstates]]
+            so, sv = (1, 0) if vacuum_td.extype == 0 else (0, 1)
+            shape = (np.count_nonzero(vacuum_td._scf.mo_occ[so]),
+                     np.count_nonzero(vacuum_td._scf.mo_occ[sv] == 0))
+        field_td.xy = [(x.reshape(shape), 0) for x in vectors]
 
         def gen_vind():
             return vind, diagonal
 
-        if isinstance(td, NTTDA):
-            setattr(td, {-1: 'gen_vind_sfd', 0: 'gen_vind_sc', 1: 'gen_vind_sfu'}[td.deltaS], gen_vind)
+        if isinstance(field_td, NTTDA):
+            setattr(field_td, {-1: 'gen_vind_sfd', 0: 'gen_vind_sc', 1: 'gen_vind_sfu'}[field_td.deltaS], gen_vind)
         else:
-            td.gen_vind = gen_vind
-        if len(td.e) == 0 or not np.all(td.converged):
-            x = np.array([np.asarray(x).ravel() for x, _ in td.xy])
-            residuals = np.linalg.norm(gas_vind(x) + solvent_vind(x) - td.e[:, None] * x, axis=1)
+            field_td.gen_vind = gen_vind
+        if len(field_td.e) != nroots or not np.all(field_td.converged):
+            x = np.asarray(vectors)
+            residuals = np.linalg.norm(vind(x) - field_td.e[:, None] * x, axis=1)
             raise RuntimeError(f'The TDA eigensolver did not converge in the PCM reaction field: {residuals}.')
-        return td
+        return field_td
 
-    def kernel(self, state=1):
-        """Equilibrate one physical root; follow it by amplitude overlap.
+    def kernel(self, state=1, *, follow_state=False):
+        """Equilibrium SS: relax static solvent polarization with one physical root.
 
-        ``state`` is the 1-based gas-phase root index. ``self.state`` reports
-        the final energy-ordered index after following the root.
+        By default, ``state`` selects the 1-based energy-ordered root in every
+        iteration. With ``follow_state=True``, it selects the initial vacuum
+        root, then amplitude overlap tracks it. ``self.state`` is the final
+        energy-ordered index. Reference orbitals and the vacuum kernel stay fixed.
         """
         if not isinstance(state, (int, np.integer)) or not 1 <= state <= self.base.nstates:
             raise ValueError('state must be between 1 and base.nstates.')
@@ -366,28 +402,28 @@ class StateSpecificPCM(lib.StreamObject):
         self.e_ss = self.ss_dm = self.ss_td = self.ss_state = None
         self.ss_cycles = 0
         self.ss_history = []
-        td = self._solve(self.base, self._gas_response, np.zeros_like(self._dm_ref))
-        self.gas_td = td
-        if state > len(td.xy):
-            raise ValueError('The requested gas-phase root is outside the computed spectrum.')
-        previous = np.asarray(td.xy[state - 1][0]).ravel()
-        dm = state_density(td, state).real
+        field_td = self._solve(self.base, self._vacuum_response, np.zeros_like(self._dm_ref))
+        self.gas_td = field_td
+        if state > len(field_td.xy):
+            raise ValueError('The requested vacuum root is outside the computed spectrum.')
+        previous = np.asarray(field_td.xy[state - 1][0]).ravel()
+        dm = state_density(field_td, state).real
         e_last = None
         extrapolator = lib.diis.DIIS(self, incore=True) if self.diis_space >= 2 else None
         if extrapolator is not None:
             extrapolator.space = self.diis_space
         for cycle in range(1, self.max_cycle + 1):
             _, v = self.with_solvent.kernel(dm)
-            x0 = np.array([np.asarray(x).ravel() for x, _ in td.xy])
-            td = self._solve(self.base, self._gas_response, v, x0=x0)
-            overlaps = np.array([abs(np.vdot(previous, x)) for x, _ in td.xy])
-            root = int(overlaps.argmax())
-            if overlaps[root] < 0.5:
+            x0 = np.array([np.asarray(x).ravel() for x, _ in field_td.xy])
+            field_td = self._solve(self.base, self._vacuum_response, v, x0=x0)
+            overlaps = np.array([abs(np.vdot(previous, x)) for x, _ in field_td.xy])
+            root = int(overlaps.argmax()) if follow_state else state - 1
+            if follow_state and overlaps[root] < 0.5:
                 raise RuntimeError('Lost the physical root during PCM iteration; compute more roots or inspect mixing.')
-            dm_new = state_density(td, root + 1).real
+            dm_new = state_density(field_td, root + 1).real
             e_pcm, v_new = self.with_solvent.kernel(dm_new)
-            e_gas = td.e[root] - np.einsum('ij,ji->', v, dm_new - self._dm_ref)
-            energy = float(self.base._scf.e_tot + e_gas + e_pcm)
+            e_vacuum = field_td.e[root] - np.einsum('ij,ji->', v, dm_new - self._dm_ref)
+            energy = float(self.base._scf.e_tot + e_vacuum + e_pcm)
             dm_error = np.linalg.norm(dm_new - dm)
             de = np.inf if e_last is None else energy - e_last
             self.history.append((energy, dm_error, float(overlaps[root])))
@@ -395,24 +431,27 @@ class StateSpecificPCM(lib.StreamObject):
                         cycle, root + 1, energy, de, dm_error, overlaps[root])
             self.cycles = cycle
             self.state = root + 1
-            self.dm, self.v, self.e_tot, self.td = dm_new, v_new, energy, td
+            self.dm, self.v, self.e_tot, self.td = dm_new, v_new, energy, field_td
             if abs(de) < self.conv_tol and dm_error < self.conv_tol_dm:
                 self.converged = True
-                self._equilibrium_xy = (td.xy[root][0].copy(), 0)
+                self._equilibrium_xy = (field_td.xy[root][0].copy(), 0)
                 break
             e_last = energy
             dm = dm_new if extrapolator is None else extrapolator.update(dm_new, xerr=dm_new-dm)
-            previous = np.asarray(td.xy[root][0]).ravel()
+            previous = np.asarray(field_td.xy[root][0]).ravel()
         if not self.converged:
             raise RuntimeError(f'Physical-state PCM did not converge in {self.max_cycle} cycles.')
         return self.e_tot
 
-    def state_specific(self, state, td=None):
+    def state_specific(self, state, td=None, *, follow_state=False):
         """Return one non-equilibrium SS gap, keeping the source slow field fixed.
 
-        ``state`` indexes the common-field (``vertical(method='frozen')``)
-        spectrum, starting at one. Follow that root while relaxing the fast
-        polarization and its amplitudes. Reference orbitals stay fixed.
+        Run ``kernel`` first to equilibrate the source's fast and slow field.
+        ``td`` optionally supplies another vacuum spin-sector template on the
+        same SCF object. By default, ``state`` selects the 1-based energy-ordered
+        root in every iteration. With ``follow_state=True``, track the initial
+        common-field root by amplitude overlap. Only fast polarization and
+        target amplitudes relax; reference orbitals and the source slow field stay fixed.
         The source ``dm``, ``v``, ``e_tot`` and ``state`` are preserved.
         Target results are stored in ``e_ss``, ``ss_dm``, ``ss_td``,
         ``ss_state``, ``ss_cycles``, ``ss_history`` and ``ss_converged``.
@@ -425,40 +464,40 @@ class StateSpecificPCM(lib.StreamObject):
         self.e_ss = self.ss_dm = self.ss_td = self.ss_state = None
         self.ss_cycles = 0
         self.ss_history = []
-        template = self.base if td is None else td
-        if not isinstance(state, (int, np.integer)) or not 1 <= state <= template.nstates:
+        vacuum_td = self.base if td is None else td
+        if not isinstance(state, (int, np.integer)) or not 1 <= state <= vacuum_td.nstates:
             raise ValueError('state must index a common-field root (1-based).')
         self.vertical(td, method='frozen')
-        work = self.td
-        if state > len(work.xy):
+        target_td = self.td
+        if state > len(target_td.xy):
             raise ValueError('The requested root is outside the common-field spectrum.')
-        gas_response = self._gas_response if td is None else self._build_response(td)
+        vacuum_response = self._vacuum_response if td is None else self._build_response(td)
         fast = self.with_solvent.copy().reset()
         fast.eps = self.eps_optical
         e_pcm, _ = self.with_solvent.kernel(self.dm)
-        previous = np.asarray(work.xy[state - 1][0]).ravel()
-        dm = state_density(work, state).real
+        previous = np.asarray(target_td.xy[state - 1][0]).ravel()
+        dm = state_density(target_td, state).real
         e_last = None
         extrapolator = lib.diis.DIIS(self, incore=True) if self.diis_space >= 2 else None
         if extrapolator is not None:
             extrapolator.space = self.diis_space
         for cycle in range(1, self.max_cycle + 1):
             potential = self.v + fast._B_dot_x(dm - self.dm)
-            x0 = np.array([np.asarray(x).ravel() for x, _ in work.xy])
-            work = self._solve(template, gas_response, potential, x0=x0)
-            overlaps = np.array([abs(np.vdot(previous, x)) for x, _ in work.xy])
-            root = int(overlaps.argmax())
-            if overlaps[root] < 0.5:
+            x0 = np.array([np.asarray(x).ravel() for x, _ in target_td.xy])
+            target_td = self._solve(vacuum_td, vacuum_response, potential, x0=x0)
+            overlaps = np.array([abs(np.vdot(previous, x)) for x, _ in target_td.xy])
+            root = int(overlaps.argmax()) if follow_state else state - 1
+            if follow_state and overlaps[root] < 0.5:
                 raise RuntimeError('Lost the target root during non-equilibrium SS iteration; inspect more roots.')
-            dm_new = state_density(work, root + 1).real
+            dm_new = state_density(target_td, root + 1).real
             delta = dm_new - self.dm
-            e_gas = work.e[root] - np.einsum('ij,ji', potential, dm_new - self._dm_ref)
-            energy = float(self.base._scf.e_tot + e_gas + e_pcm + np.einsum('ij,ji', self.v, delta)
+            e_vacuum = target_td.e[root] - np.einsum('ij,ji', potential, dm_new - self._dm_ref)
+            energy = float(self.base._scf.e_tot + e_vacuum + e_pcm + np.einsum('ij,ji', self.v, delta)
                            + 0.5 * np.einsum('ij,ji', delta, fast._B_dot_x(delta)))
             error = np.linalg.norm(dm_new - dm)
             de = np.inf if e_last is None else energy - e_last
             self.ss_history.append((energy, error, float(overlaps[root])))
-            self.e_ss, self.ss_dm, self.ss_td = energy, dm_new, work
+            self.e_ss, self.ss_dm, self.ss_td = energy, dm_new, target_td
             self.ss_state, self.ss_cycles = root + 1, cycle
             logger.info(self, 'Non-equilibrium SS cycle %d: root=%d G=%.12f dG=%.3g |dD|=%.3g overlap=%.6f',
                         cycle, root + 1, energy, de, error, overlaps[root])
@@ -467,7 +506,7 @@ class StateSpecificPCM(lib.StreamObject):
                 return energy - self.e_tot
             e_last = energy
             dm = dm_new if extrapolator is None else extrapolator.update(dm_new, xerr=dm_new-dm)
-            previous = np.asarray(work.xy[root][0]).ravel()
+            previous = np.asarray(target_td.xy[root][0]).ravel()
         raise RuntimeError(f'Non-equilibrium SS did not converge in {self.max_cycle} cycles.')
 
     def vertical(self, td=None, method='ptss'):
@@ -477,32 +516,34 @@ class StateSpecificPCM(lib.StreamObject):
         share the original mean-field object, orbitals and energy reference.
         This method preserves the equilibrated density and reaction field.
         ``method`` selects ``'ptss'`` (difference-density correction),
-        ``'ptlr'`` (first-order pole shift from physical-root transition
-        densities), or ``'frozen'`` (common-field baseline). ptLR and ptSS
-        are separate approximations; their corrections are not added.
+        ``'ptlr'`` (experimental first-order pole shift from physical-root
+        transition densities), or ``'frozen'`` (common-field baseline).
+        ptLR assumes isolated roots and has model-internal Hessian checks;
+        independent physical benchmarks and coupled near-degenerate response
+        remain to be established. ptSS is the default energy approximation.
         """
         if not self.converged:
             raise RuntimeError('Run kernel(state=...) to equilibrate a physical state first.')
         if method not in ('ptss', 'ptlr', 'frozen'):
             raise ValueError("method must be 'ptss', 'ptlr', or 'frozen'.")
+        vacuum_td = self.base if td is None else td
         if td is None:
-            td = self.base
-            gas_response = self._gas_response
+            vacuum_response = self._vacuum_response
         else:
-            _validate_td(td)
-            if isinstance(td, _FrozenFieldTDA):
-                raise ValueError('Supply a gas-phase TDA object for the target sector.')
-            if td._scf is not self.base._scf:
-                raise ValueError('All sectors must share the same gas-phase SCF object.')
-            gas_response = self._build_response(td)
-        same_previous_sector = ((isinstance(self.td, NTTDA) and isinstance(td, NTTDA)
-                                 and self.td.deltaS == td.deltaS)
-                                or (isinstance(self.td, TDA_SF) and isinstance(td, TDA_SF)
-                                    and self.td.extype == td.extype))
+            _validate_td(vacuum_td)
+            if isinstance(vacuum_td, _FrozenFieldTDA):
+                raise ValueError('Supply a vacuum TDA object for the target sector.')
+            if vacuum_td._scf is not self.base._scf:
+                raise ValueError('All sectors must share the same vacuum SCF object.')
+            vacuum_response = self._build_response(vacuum_td)
+        same_previous_sector = ((isinstance(self.td, NTTDA) and isinstance(vacuum_td, NTTDA)
+                                 and self.td.deltaS == vacuum_td.deltaS)
+                                or (isinstance(self.td, TDA_SF) and isinstance(vacuum_td, TDA_SF)
+                                    and self.td.extype == vacuum_td.extype))
         x0 = None
         if same_previous_sector:
             x0 = np.array([np.asarray(x).ravel() for x, _ in self.td.xy])
-        self.td = self._solve(td, gas_response, self.v, x0=x0)
+        self.td = self._solve(vacuum_td, vacuum_response, self.v, x0=x0)
         e_pcm, _ = self.with_solvent.kernel(self.dm)
         offset = self.base._scf.e_tot + e_pcm - np.einsum('ij,ji->', self.v, self.dm - self._dm_ref)
         self.e_frozen = self.td.e + offset
@@ -525,10 +566,10 @@ class StateSpecificPCM(lib.StreamObject):
         # perturbative root-to-root LR model; near-degenerate poles require
         # the coupled response problem, which is outside this driver.
         self.ptlr_correction = np.zeros(len(self.td.e))
-        same_sector = ((isinstance(self.base, NTTDA) and isinstance(td, NTTDA)
-                        and self.base.deltaS == td.deltaS)
-                       or (isinstance(self.base, TDA_SF) and isinstance(td, TDA_SF)
-                           and self.base.extype == td.extype))
+        same_sector = ((isinstance(self.base, NTTDA) and isinstance(vacuum_td, NTTDA)
+                        and self.base.deltaS == vacuum_td.deltaS)
+                       or (isinstance(self.base, TDA_SF) and isinstance(vacuum_td, TDA_SF)
+                           and self.base.extype == vacuum_td.extype))
         if same_sector:
             density_td = self.td.copy()
             density_td.xy = list(self.td.xy) + [self._equilibrium_xy]

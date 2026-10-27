@@ -35,11 +35,11 @@ mf.conv_tol = 1e-10
 mf.kernel()
 assert mf.converged
 
-td = mf.TDA_SF().set(extype=1, collinear='mcol', collinear_samples=20, nstates=5)
+vacuum_td = mf.TDA_SF().set(extype=1, collinear='mcol', collinear_samples=20, nstates=5)
 field = pcm.PCM(mol)
 field.eps = 78.3553
 field.lebedev_order = 11
-calculation = StateSpecificPCM(td, field, eps_optical=1.333**2)
+calculation = StateSpecificPCM(vacuum_td, field, eps_optical=1.333**2)
 calculation.verbose = 4
 calculation.kernel(state=1)
 gaps = calculation.vertical(method='ptss') * HARTREE2EV

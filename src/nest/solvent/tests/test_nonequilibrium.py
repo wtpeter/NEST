@@ -215,8 +215,8 @@ class NonEquilibriumTests(unittest.TestCase):
                 fast = field.copy().reset()
                 fast.eps = 2
                 x = sol.ss_td.xy[sol.ss_state-1][0].ravel()
-                gas, _ = sol._gas_response
-                expected = (uks.e_tot + x @ gas(x[None])[0] + field.kernel(sol.dm)[0]
+                vacuum_vind, _ = sol._vacuum_response
+                expected = (uks.e_tot + x @ vacuum_vind(x[None])[0] + field.kernel(sol.dm)[0]
                             + np.einsum('ij,ji', sol.v, delta)
                             + 0.5*np.einsum('ij,ji', delta, fast._B_dot_x(delta)))
                 self.assertAlmostEqual(sol.e_ss, expected, places=9)

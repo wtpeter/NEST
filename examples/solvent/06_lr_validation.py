@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""在完整的小模型态空间中比较 ptLR 与耦合 LR。
+"""实验性 ptLR 的模型内部检查：在完整的小模型态空间中比较 ptLR 与耦合 LR。
 
 水/HF/STO-3G 用于算法验证。完整空间的实部与虚部能量 Hessian
 还在 test_nonequilibrium.py 中由有限差分独立检查。
@@ -35,12 +35,12 @@ from nest.solvent.pcm import _transition_density  # 研究验证使用的内部 
 
 mol = gto.M(atom='O 0 0 0; H 0 -.757 .587; H 0 .757 .587', basis='sto-3g', spin=2, verbose=0)
 mf = mol.ROKS(xc='HF').run(conv_tol=1e-11)
-# 18 维原始空间包含一个自旋旋转零模；驱动去掉它后得到 17 个物理根。
-td = mf.NTTDA().set(deltaS=-1, nstates=18, conv_tol=1e-10)
+# 18 维原始空间包含一个自旋旋转零模；驱动在其正交补空间求 17 个物理根。
+vacuum_td = mf.NTTDA().set(deltaS=-1, nstates=18, conv_tol=1e-10)
 field = pcm.PCM(mol)
 field.eps = 10
 field.lebedev_order = 7
-calculation = StateSpecificPCM(td, field, eps_optical=2)
+calculation = StateSpecificPCM(vacuum_td, field, eps_optical=2)
 calculation.conv_tol_dm = 1e-9
 calculation.kernel()
 calculation.vertical(method='ptlr')

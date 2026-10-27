@@ -6,7 +6,7 @@
 
 ## 模型与文献的对应关系
 
-NEST 以固定参考轨道上的气相 TDA 矩阵 $A_0$ 作为有效电子算符。物理态振幅
+NEST 以固定参考轨道上的真空 TDA 矩阵 $A_0$ 作为有效电子算符。物理态振幅
 $x$ 满足 $x^\dagger x=1$，其电荷密度 $D[x]$ 包含参考占据。平衡能量为
 
 $$G[x]=E_{\rm ref}+x^\dagger A_0x+E_{\rm PCM}[D[x]].$$
@@ -21,7 +21,7 @@ $$G[x]=E_{\rm ref}+x^\dagger A_0x+E_{\rm PCM}[D[x]].$$
 $$\lambda=x^\dagger A_0x+\operatorname{Tr}\{V(D[x]-D_{\rm ref})\}.$$
 
 总能量中用此式恢复 $x^\dagger A_0x$，再加入 PCM 极化能。这个计数由
-气相极限、完整密度的显式行列式验证，以及独立驻点方程共同检查。
+真空极限、完整密度的显式行列式验证，以及独立驻点方程共同检查。
 
 ## Marcus 与 Pekar 分割
 
@@ -75,7 +75,7 @@ ptSS 在共同反应场的波函数上计算此泛函。新增的 `state_specifi
 ```python
 calculation.kernel(state=1)                   # 建立出发态 A 的平衡环境
 ptss = calculation.vertical().copy()
-ss_gap = calculation.state_specific(state=2)   # 共同场谱的第 2 根，1-based
+ss_gap = calculation.state_specific(state=2)   # 每轮按能量取第 2 根，1-based
 print(ptss[1], ss_gap)                        # 都相对于 A，单位 Hartree
 print(calculation.ss_cycles, calculation.ss_converged)
 ```
@@ -96,7 +96,7 @@ print(calculation.ss_cycles, calculation.ss_converged)
   $10^{-9}$ Hartree，密度比较至 $2\times10^{-8}$。
 - 覆盖 SF 的 `col`、`mcol`，以及 NT 单重态环境中的三重态目标。
 
-## ptLR 与耦合 LR
+## 实验性 ptLR 与耦合 LR
 
 对同一个非平衡泛函在出发态附近作小振幅展开。用完整共同场物理根作基，设
 $\Delta_k$ 是固定场能隙，$D_{Ak}$ 是物理根之间的跃迁密度，并定义
@@ -118,6 +118,10 @@ $$A_{\rm LR}=\operatorname{diag}(\Delta)+K,\qquad B_{\rm LR}=K,\qquad
 方向放进人为近简并的两能级模型，展示非对角耦合引起的模混合。大体系只取少数
 根时，类似矩阵具有额外的态空间截断误差。当前公共能量接口继续提供 ptLR；
 完整耦合 LR 在本批作为验证程序使用。
+
+上述推导和差分检查针对本实现的固定轨道有效模型。ptLR 的独立程序对照、
+定量物理基准及激发出发态的系统验证仍待补充。当前常规能量计算优先使用
+ptSS，并通过非平衡 SS 抽查振幅弛豫效应。
 
 ## 收敛加速
 
@@ -142,6 +146,9 @@ CT 目标在自洽后分别排序为第 5、6 根，跟踪保持了对应关系�
 这些固定轨道模型中使用 ptSS 近似。CT 的小基组限制了可用极化自由度；对更大
 基组、强态混合或其他构型，应继续用 `state_specific` 抽查误差。
 
+以上历史结果使用振幅重叠跟踪。当前默认按能量序号选根；`05_ss_validation.py`
+对 CT 目标显式传入 `follow_state=True`，保持与上述比较相同的态定义。
+
 | 计算部分 | 直接迭代轮数 | DIIS 轮数 |
 |---|---:|---:|
 | 甲醛出发态 | 9 | 5 |
@@ -156,8 +163,8 @@ CT 目标在自洽后分别排序为第 5、6 根，跟踪保持了对应关系�
 实测值，轮数和能量一致性提供了更直接的比较。
 
 另外按 `03_solvatochromism.py` 的对硝基苯胺设置启用 `diis_space=6`，完整流程
-耗时 499.5 秒，第一批直接迭代为 769.8 秒。所选气相第 5 根仍对应溶液第 3 根，
-振幅重叠为 0.990971；ptSS 能隙仍为 3.97053 eV，气相到水模型的位移仍为
+耗时 499.5 秒，第一批直接迭代为 769.8 秒。所选真空第 5 根仍对应溶液第 3 根，
+振幅重叠为 0.990971；ptSS 能隙仍为 3.97053 eV，真空到水模型的位移仍为
 −0.48663 eV。这项成本比较使用了相同计算设置，机器上的其他负载可能不同。
 
 小模型完整耦合 LR 与 ptLR 按谱排序比较的最大能量差为：
@@ -178,6 +185,36 @@ CT 目标在自洽后分别排序为第 5、6 根，跟踪保持了对应关系�
 OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 MKL_NUM_THREADS=2 \
     python -m pytest src/nest/solvent/tests src/nest/sftda/tests src/nest/nttda/tests -q
 ```
+
+## 求解与选根更新（2026-10-27）
+
+当前内层使用 `nest._lr_eig.eigh`。NT-down 对初猜、完整反应场算符和预条件
+向量投影，保留 OO 块的无迹子空间。新增测试与完整矩阵的物理子空间谱比较，
+覆盖零能量物理根、1 根/3 根/完整空间以及重复振幅初猜。
+
+修正了共享求解器的预条件向量归一化：判断线性相关性前先归一化方向，避免
+严格残差阈值下的有效修正向量因绝对幅度过小而被丢弃。独立测试检查接近收敛
+的初猜，以及预条件器整体缩放 $10^{-8}$ 后的收敛与本征残差。
+
+`kernel` 和 `state_specific` 默认每轮按能量序号选根；`follow_state=True` 显式
+开启重叠跟踪。控制根交叉的测试覆盖两个入口的第 1、2 根；另有对角模型检查
+上一轮精确本征向量作为初猜时，仍能找到交叉后新的最低根。
+
+在 `nest` 环境中使用 OMP、MKL、OpenBLAS 各 2 线程运行：
+
+```bash
+python -m pytest src/nest/tests/test_lr_eig.py src/nest/solvent/tests \
+    src/nest/sftda/tests src/nest/nttda/tests -q
+```
+
+结果：**55 个测试、28 个子测试通过**。这些检查验证固定 vacuum 轨道模型的
+数值实现；参考轨道极化和 ptLR 的外部物理基准继续留待后续研究。
+
+同日重跑 `05_ss_validation.py`：甲醛按能量序号求第二根，SS 能隙为
+3.88712008 eV；CT 二聚体显式跟踪初始第 10、15 根，最终排序为第 5、6 根，
+SS 能隙分别为 13.55116464、14.36460195 eV。直接迭代与 DIIS 的总能量和
+能隙差小于 $10^{-8}$ Hartree，保持上述历史参考结果。甲醛源态轮数为 9→5，
+目标态为 5→4；两个 CT 目标的轮数分别为 5→4、3→3。
 
 ## 梯度范围
 

@@ -57,7 +57,7 @@ print('\nS0 环境中的单重态垂直能隙 / eV')
 for method in ('frozen', 'ptss', 'ptlr'):
     gaps = calculation.vertical(method=method) * HARTREE2EV
     print(f'{method:>6}:', ' '.join(f'{value:9.5f}' for value in gaps))
-print('ptLR 为孤立根的一阶近似；高能的近简并根需要进一步考虑耦合响应。')
+print('ptLR 是实验性的孤立根一阶响应近似；当前验证限于固定轨道模型内部。')
 
 # 同一个 mf 保证两个自旋分支使用共同轨道和能量零点。
 triplets = mf.NTTDA().set(deltaS=0, nstates=5)

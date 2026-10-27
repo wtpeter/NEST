@@ -13,13 +13,16 @@
 # limitations under the License.
 
 import unittest
+from unittest.mock import patch
 
 import numpy as np
+from scipy.linalg import null_space
 from pyscf import dft, gto
 from pyscf.solvent import pcm
 
 from nest.solvent import StateSpecificPCM, state_density
 from nest.solvent.pcm import _potential_action
+from nest.nttda.nttda import _orbital_indices
 
 
 class PCMTests(unittest.TestCase):
@@ -38,7 +41,7 @@ class PCMTests(unittest.TestCase):
         obj.lebedev_order = 7
         return obj
 
-    def test_gas_limit_all_nt_sectors_and_sf_collinear_branches(self):
+    def test_vacuum_limit_all_nt_sectors_and_sf_collinear_branches(self):
         methods = [self.mf.NTTDA().set(deltaS=ds, nstates=3) for ds in (-1, 0, 1)]
         methods += [self.uks.TDA_SF().set(collinear=col, collinear_samples=20, nstates=3)
                     for col in ('col', 'mcol')]
@@ -76,14 +79,88 @@ class PCMTests(unittest.TestCase):
         # equilibrium PCM energy evaluated on each *fixed-field* wavefunction.
         sol.eps_optical = 10
         sol.vertical()
-        gas_vind, _ = sol._gas_response
+        vacuum_vind, _ = sol._vacuum_response
         direct = []
         for k, (x, _) in enumerate(sol.td.xy):
             x = x.ravel()
             dm = state_density(sol.td, k + 1)
             epcm, _ = self.solvent().kernel(dm)
-            direct.append(self.mf.e_tot + np.vdot(x, gas_vind(x[None, :])[0]).real + epcm)
+            direct.append(self.mf.e_tot + np.vdot(x, vacuum_vind(x[None, :])[0]).real + epcm)
         np.testing.assert_allclose(sol.e_ptss, direct, atol=2e-9)
+
+    def test_projected_nt_down_against_dense_spectrum_and_warm_starts(self):
+        vacuum_td = self.mf.NTTDA().set(deltaS=-1, nstates=3, conv_tol=1e-10)
+        sol = StateSpecificPCM(vacuum_td, self.solvent(), eps_optical=2)
+        vacuum_vind, diagonal = sol._vacuum_response
+        matrix = vacuum_vind(np.eye(len(diagonal))).T
+        cs, os, vs = _orbital_indices(vacuum_td)
+        rotation = np.zeros((len(cs)+len(os), len(os)+len(vs)))
+        rotation[len(cs)+np.arange(len(os)), np.arange(len(os))] = 1 / np.sqrt(len(os))
+        physical = null_space(rotation.reshape(1, -1))
+        _, potential = self.solvent().kernel(sol._dm_ref)
+        solvent_vind, _ = _potential_action(vacuum_td, potential)
+        matrix += solvent_vind(np.eye(len(diagonal))).T
+        expected = np.linalg.eigvalsh(physical.T @ matrix @ physical)
+        # Put a physical root exactly at zero, next to the redundant direction.
+        shift = expected[0]
+
+        def shifted_vind(z):
+            return vacuum_vind(z) - shift*np.asarray(z)
+
+        response = shifted_vind, diagonal-shift
+        for nstates in (1, 3, len(diagonal)):
+            with self.subTest(nstates=nstates):
+                vacuum_td.nstates = nstates
+                previous = None
+                for _ in range(3):
+                    field_td = sol._solve(vacuum_td, response, potential, x0=previous)
+                    previous = np.array([x.ravel() for x, _ in field_td.xy])
+                    n = min(nstates, len(expected))
+                    np.testing.assert_allclose(field_td.e, expected[:n]-shift, atol=1e-10)
+                    np.testing.assert_allclose(previous @ rotation.ravel(), 0, atol=1e-12)
+                    np.testing.assert_allclose(previous @ previous.T, np.eye(n), atol=1e-11)
+                    action, _ = field_td.gen_vind_sfd()
+                    residual = action(previous) - field_td.e[:, None]*previous
+                    self.assertLess(np.linalg.norm(residual, axis=1).max(), 1e-10)
+
+    def test_root_order_and_optional_tracking_at_a_crossing(self):
+        vacuum_td = self.mf.NTTDA().set(deltaS=-1, nstates=3, conv_tol=1e-10)
+        sol = StateSpecificPCM(vacuum_td, self.solvent(1), eps_optical=1)
+        sol.kernel()
+        initial = sol.td.copy()
+        crossed = initial.copy()
+        # Prescribe a crossing between two normalized physical roots. This
+        # isolates root selection from the convergence of a particular solvent.
+        crossed.xy = [initial.xy[1], initial.xy[0], initial.xy[2]]
+        for method in ('kernel', 'state_specific'):
+            for state in (1, 2):
+                for follow in (False, True):
+                    with self.subTest(method=method, state=state, follow_state=follow):
+                        sol.kernel()
+                        kwargs = {'follow_state': True} if follow else {}
+                        with patch.object(sol, '_solve', side_effect=[initial, crossed, crossed, crossed]):
+                            getattr(sol, method)(state=state, **kwargs)
+                        expected_state = 3-state if follow else state
+                        if method == 'kernel':
+                            actual_state, dm = sol.state, sol.dm
+                        else:
+                            actual_state, dm = sol.ss_state, sol.ss_dm
+                        self.assertEqual(actual_state, expected_state)
+                        np.testing.assert_allclose(dm, state_density(crossed, expected_state), atol=1e-12)
+
+    def test_fixed_field_warm_start_can_find_a_new_lower_root(self):
+        vacuum_td = self.uks.TDA_SF().set(nstates=1, conv_tol=1e-10)
+        sol = StateSpecificPCM(vacuum_td, self.solvent(1), eps_optical=1)
+        _, diagonal = sol._vacuum_response
+        diagonal = np.arange(len(diagonal), dtype=float)
+        # An exact old eigenvector has zero residual after a diagonal level
+        # crossing. Extra guesses let the solver discover the new lowest root.
+        diagonal[:2] = [1, -1]
+        initial = np.eye(1, len(diagonal))
+        field_td = sol._solve(vacuum_td, (lambda z: z*diagonal, diagonal),
+                              np.zeros_like(sol._dm_ref), x0=initial)
+        self.assertAlmostEqual(field_td.e[0], -1, places=12)
+        self.assertAlmostEqual(abs(field_td.xy[0][0].ravel()[1]), 1, places=12)
 
     def test_common_environment_across_spin_sectors(self):
         sol = StateSpecificPCM(self.mf.NTTDA().set(deltaS=-1, nstates=3, conv_tol=1e-10),
@@ -102,7 +179,7 @@ class PCMTests(unittest.TestCase):
         np.testing.assert_array_equal(sol.dm, dm)
         np.testing.assert_array_equal(sol.v, v)
         self.assertEqual(sol.e_tot, energy)
-        with self.assertRaisesRegex(ValueError, 'same gas-phase'):
+        with self.assertRaisesRegex(ValueError, 'same vacuum'):
             sol.vertical(self.mf.copy().NTTDA())
 
         # Establish a separate triplet environment for the reverse process.
@@ -121,12 +198,12 @@ class PCMTests(unittest.TestCase):
                 sol = StateSpecificPCM(td, self.solvent(), eps_optical=10)
                 sol.kernel()
                 sol.vertical()
-                gas_vind, _ = sol._gas_response
+                vacuum_vind, _ = sol._vacuum_response
                 for k, (x, _) in enumerate(sol.td.xy):
                     dm = state_density(sol.td, k + 1)
                     epcm, _ = self.solvent().kernel(dm)
                     x = x.ravel()
-                    direct = self.uks.e_tot + np.vdot(x, gas_vind(x[None, :])[0]).real + epcm
+                    direct = self.uks.e_tot + np.vdot(x, vacuum_vind(x[None, :])[0]).real + epcm
                     self.assertAlmostEqual(sol.e_ptss[k], direct, places=9)
                 self.assertGreater(np.linalg.norm(sol.ptss_correction[1:]), 1e-6)
                 for method in (sol.td.Gradients, sol.td.NAC, sol.td.as_scanner):
@@ -160,8 +237,8 @@ class PCMTests(unittest.TestCase):
         source = sol.td.xy[0][0].ravel()
         target = sol.td.xy[1][0].ravel()
         frozen_gap = sol.e_frozen[1] - sol.e_frozen[0]
-        gas_vind, gas_diag = sol._gas_response
-        gas_matrix = gas_vind(np.eye(len(gas_diag))).T
+        vacuum_vind, vacuum_diag = sol._vacuum_response
+        vacuum_matrix = vacuum_vind(np.eye(len(vacuum_diag))).T
         fast = self.solvent(2)
         work = sol.td.copy()
         shape = sol.td.xy[0][0].shape
@@ -170,7 +247,7 @@ class PCMTests(unittest.TestCase):
             x = np.cos(angle) * source + np.sin(angle) * target
             work.xy = [(x.reshape(shape), 0)]
             delta = state_density(work) - sol.dm
-            return (x @ gas_matrix @ x + np.einsum('ij,ji', sol.v, delta)
+            return (x @ vacuum_matrix @ x + np.einsum('ij,ji', sol.v, delta)
                     + 0.5 * np.einsum('ij,ji', delta, fast._B_dot_x(delta)))
 
         step = 2e-4

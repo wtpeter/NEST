@@ -16,7 +16,7 @@
 """相同慢溶剂环境下比较 ptSS 与自洽 SS，并测量 DIIS 的作用。
 
 甲醛使用 CAM-B3LYP/def2-SVP；SI 二聚体使用 HF/STO-3G 识别 CT 根。
-所有根编号都指同一个出发态固定场谱，SS 迭代用振幅重叠跟踪目标根。
+甲醛按能量序号选择第二根；CT 二聚体显式开启振幅重叠跟踪，以保持 CT 态身份。
 """
 
 import os
@@ -49,7 +49,7 @@ for name, atom, basis, xc, nstates in (
     mf.conv_tol = 1e-10
     mf.kernel()
     assert mf.converged
-    td = mf.NTTDA().set(deltaS=-1, nstates=nstates)
+    vacuum_td = mf.NTTDA().set(deltaS=-1, nstates=nstates)
     field = pcm.PCM(mol)
     field.eps = 78.3553
     field.lebedev_order = 11
@@ -58,7 +58,7 @@ for name, atom, basis, xc, nstates in (
     print(f'\n{name}: {xc}/{basis}', flush=True)
     for diis_space in (0, 6):
         started = perf_counter()
-        calculation = StateSpecificPCM(td, field, eps_optical=1.333**2)
+        calculation = StateSpecificPCM(vacuum_td, field, eps_optical=1.333**2)
         calculation.diis_space = diis_space
         calculation.verbose = 4
         calculation.kernel(state=1)
@@ -80,7 +80,7 @@ for name, atom, basis, xc, nstates in (
         print(f'DIIS space={diis_space}; source cycles={calculation.cycles}', flush=True)
         ss_gaps = []
         for state in targets:
-            gap_ss = calculation.state_specific(state)
+            gap_ss = calculation.state_specific(state, follow_state=(name == 'CT dimer'))
             ss_gaps.append(gap_ss)
             # SS 自洽后根可能重排；这里检查目标态与初始固定场根的重叠。
             x = calculation.ss_td.xy[calculation.ss_state-1][0]

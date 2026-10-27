@@ -307,6 +307,11 @@ def eigh(aop, x0, precond, tol_residual=1e-5, lindep=1e-12, nroots=1,
         for k, xk in enumerate(xt):
             if dx_norm[k] > tol_residual:
                 xt[k] = precond(xk, e[0])
+                # Test dependency of directions, independently of the residual
+                # size or preconditioner scale (as in lib.davidson1).
+                norm = np.linalg.norm(xt[k])
+                if norm > 0:
+                    xt[k] /= norm
         for _ in range(2):
             xt -= xs.conj().dot(xt.T).T.dot(xs)
         xt_norm = np.linalg.norm(xt, axis=1)

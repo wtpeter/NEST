@@ -38,15 +38,15 @@ mf = mol.ROKS(xc='HF').run(conv_tol=1e-10)
 assert mf.converged
 
 # CT 态可能高于最低几个局域激发态，因此这个专门的态搜索例子求更多根。
-td = mf.NTTDA().set(deltaS=-1, nstates=16)
+vacuum_td = mf.NTTDA().set(deltaS=-1, nstates=16)
 field = pcm.PCM(mol)
 field.eps = 78.3553
 field.lebedev_order = 11
-calculation = StateSpecificPCM(td, field, eps_optical=1.333**2)
+calculation = StateSpecificPCM(vacuum_td, field, eps_optical=1.333**2)
 calculation.verbose = 4
 calculation.kernel(state=1)
 gaps = calculation.vertical()
-gas = calculation.gas_td
+vacuum = calculation.gas_td
 
 # 坐标文件前 6 个原子是 C2F4。Mulliken 电荷用于这里的片段定性指认。
 fragment_ao_end = mol.aoslice_by_atom()[5, 3]
@@ -55,13 +55,13 @@ overlap = mf.get_ovlp()
 ground = state_density(calculation.td, calculation.state)
 ground_charge = fragment_nuclear_charge - np.trace((ground @ overlap)[:fragment_ao_end, :fragment_ao_end])
 
-print('\nroot   溶液能隙/eV   C2F4电荷变化/e   对应气相根   振幅重叠   位移/eV')
+print('\nroot   溶液能隙/eV   C2F4电荷变化/e   对应真空根   振幅重叠   位移/eV')
 for k, (x, _) in enumerate(calculation.td.xy):
     density = state_density(calculation.td, k + 1)
     charge = fragment_nuclear_charge - np.trace((density @ overlap)[:fragment_ao_end, :fragment_ao_end])
-    matches = np.array([abs(np.vdot(x, y)) for y, _ in gas.xy])
+    matches = np.array([abs(np.vdot(x, y)) for y, _ in vacuum.xy])
     matched = int(matches.argmax())
-    shift = (gaps[k] - (gas.e[matched] - gas.e[0])) * HARTREE2EV
+    shift = (gaps[k] - (vacuum.e[matched] - vacuum.e[0])) * HARTREE2EV
     print(f'{k+1:3d}   {gaps[k]*HARTREE2EV:12.5f}   {(charge-ground_charge).real:14.5f}'
           f'   {matched+1:10d}   {matches[matched]:8.4f}   {shift:+9.5f}')
 
