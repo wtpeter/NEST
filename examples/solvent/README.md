@@ -106,7 +106,7 @@ $D[x]$ 是包含参考占据的自旋求和波函数密度。反应势通过自�
 轨道弛豫属于后续模型扩展。
 
 内层统一使用 `nest._lr_eig.eigh`。NT-down 的 OO 单位矩阵方向在初猜、完整
-算符和预条件器中投影掉，与 `main` 的求解策略一致。求解初猜包含上一轮振幅
+算符和预条件器中投影掉，与普通 NT-TDA 共用 `_project_sfd`。求解初猜包含上一轮振幅
 和低对角元方向，以便在态重排时发现新的低能根。
 
 对于与物理态 A 平衡的环境，固定场中的目标态 k 使用以下共同环境展开：
@@ -224,4 +224,4 @@ ptLR 的能量曲率。
 - [p-Nitroaniline solvatochromism, J. Phys. Chem. A](https://doi.org/10.1021/jp110026c)。
 - [Acetone solvatochromism](https://research.rug.nl/en/publications/solvatochromism-of-the-%CF%80-n-transition-of-acetone-by-combined-quan/)。
 
-解析梯度、几何优化、SMD、完整 SF-TDDFT 和 DZ0SCF 留待后续阶段。
+溶剂解析梯度、几何优化、SMD、完整 SF-TDDFT 和平均占据参考 AOCSCF 留待后续阶段。

@@ -291,6 +291,8 @@ class PCMTests(unittest.TestCase):
             StateSpecificPCM(self.uks.TDDFT_SF(), self.solvent(), eps_optical=2)
         with self.assertRaises(ValueError):
             StateSpecificPCM(self.mf.PCM().NTTDA(), self.solvent(), eps_optical=2)
+        with self.assertRaisesRegex(TypeError, 'ordinary'):
+            StateSpecificPCM(self.mf.copy().average_occ().NTTDA(), self.solvent(), eps_optical=2)
 
         sol.max_cycle = 30
         sol.kernel()

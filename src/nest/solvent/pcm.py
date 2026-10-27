@@ -27,7 +27,7 @@ from pyscf.lib import logger
 from pyscf.solvent import pcm
 
 from nest._lr_eig import eigh
-from nest.nttda.nttda import NTTDA, _orbital_indices, _sc_vector_slices, transition_dm
+from nest.nttda.nttda import NTTDA, _orbital_indices, _project_sfd, _sc_vector_slices, transition_dm
 from nest.sftda.uhf_sf import TDA_SF, TDDFT_SF
 
 
@@ -64,7 +64,7 @@ def _validate_td(td):
         raise TypeError('StateSpecificPCM requires SF-TDA or NT-TDA.')
     mf = td._scf
     if (not isinstance(mf, (scf.uhf.UHF, scf.rohf.ROHF))
-            or any(cls.__module__.startswith('nest.dz0scf') for cls in type(mf).__mro__)):
+            or any(cls.__module__.startswith('nest.aocscf') for cls in type(mf).__mro__)):
         raise TypeError('Use an ordinary UKS/UHF or ROKS/ROHF reference.')
     if getattr(mf, 'with_solvent', None) is not None:
         raise ValueError('Start from a vacuum reference; StateSpecificPCM supplies the physical-state reaction field.')
@@ -314,15 +314,9 @@ class StateSpecificPCM(lib.StreamObject):
         if nt_down:
             cs, os, vs = _orbital_indices(vacuum_td)
             ncs, nos, nvs = len(cs), len(os), len(vs)
-            open_diag = np.arange(nos)
 
             def project(z):
-                # Match NTTDA.kernel on main: remove the OO identity direction.
-                projected = np.array(z, copy=True)
-                oo = projected.reshape(-1, ncs + nos, nos + nvs)[:, ncs:, :nos]
-                trace = np.trace(oo, axis1=1, axis2=2) / nos
-                oo[:, open_diag, open_diag] -= trace[:, None]
-                return projected
+                return _project_sfd(z, ncs, nos, nvs)
 
             def vind(z):
                 z = project(z)
