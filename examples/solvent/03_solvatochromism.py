@@ -13,71 +13,54 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SF-TDA 定性验证：丙酮 n→π* 蓝移与对硝基苯胺 π→π* 红移。
+"""Compare NT-TDA vacuum, water ptSS and water SS gaps at fixed geometries.
 
-使用固定几何和水的连续介质参数；先识别真空态，再用振幅重叠跟踪溶液态。
-打印实际计算结果。实验的氢键、构型采样等贡献属于进一步的模型验证。
+Expected trends: acetone's lowest singlet n -> pi* excitation shifts to higher
+energy (blue) [JPCA, 2009, 113, 10678];
+p-nitroaniline's bright singlet pi -> pi* excitation shifts to lower energy (red)
+[JPCA, 2011, 115, 9801].
+Both solvent calculations keep the slow polarization equilibrated with S0.
 """
 
-import os
-
-threads = min(20, int(os.environ.get('OMP_NUM_THREADS', '2')))
-for variable in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS'):
-    os.environ[variable] = str(threads)
-
-from pathlib import Path
-from time import perf_counter
 import numpy as np
 from pyscf import gto
 from pyscf.data.nist import HARTREE2EV
 from pyscf.solvent import pcm
 from nest.solvent import StateSpecificPCM
 
-geometry_folder = Path(__file__).resolve().parent / 'geometries'
 for molecule in ('acetone', 'p-nitroaniline'):
-    started = perf_counter()
-    geometry = (geometry_folder / f'{molecule}.xyz').read_text().splitlines()[2:]
-    mol = gto.M(atom='\n'.join(geometry), basis='def2-svp', spin=2, verbose=0)
-    mf = mol.UKS(xc='CAM-B3LYP').density_fit()
-    mf.grids.level = 2
-    mf.conv_tol = 1e-10
-    mf.kernel()
-    assert mf.converged
-
-    vacuum_td = mf.TDA_SF().set(extype=1, collinear='mcol', collinear_samples=20, nstates=5)
-    field = pcm.PCM(mol)
-    field.eps = 78.3553
-    field.lebedev_order = 11
-    calculation = StateSpecificPCM(vacuum_td, field, eps_optical=1.333**2)
-    calculation.verbose = 4
-    calculation.kernel(state=1)
-    solution_gaps = calculation.vertical(method='ptss')
-
-    vacuum = calculation.gas_td
-    vacuum_gaps = vacuum.e - vacuum.e[0]
-    spin_square = vacuum.spin_square()
-    strengths = vacuum.oscillator_strength(ref=1)
-    print(f'\n{molecule}: 真空根的指认')
-    for k in range(1, len(vacuum.e)):
-        print(f'root {k+1}: gap={vacuum_gaps[k]*HARTREE2EV:8.4f} eV, '
-              f'<S^2>={spin_square[k]:7.4f}, f={strengths[k-1]:.6f}')
-
-    singlet_roots = [k for k in range(1, len(vacuum.e)) if spin_square[k] < 0.5]
-    if not singlet_roots:
-        raise RuntimeError('所求根中缺少单重态候选，请增大 nstates 并检查振幅。')
+    mol = gto.M(atom=f'geometries/{molecule}.xyz', basis='def2-svp', spin=2)
+    mf = mol.ROKS(xc='CAM-B3LYP').density_fit().run()
+    td = mf.NTTDA().set(deltaS=-1, nstates=5)
+    td.kernel()
+    # All roots are singlets. Root 1 is S0; e[k] is relative to the SCF reference.
+    vacuum_gaps = td.e - td.e[0]
     if molecule == 'acetone':
-        target = min(singlet_roots, key=lambda k: vacuum_gaps[k])  # 最低单重激发态，n→π* 候选
+        target = 1  # S1: the lowest n -> pi* excitation (zero-based index).
+        expected = 'blue shift (positive)'
     else:
-        target = max(singlet_roots, key=lambda k: strengths[k-1])  # 强吸收 π→π* 候选
+        target = int(np.argmax(td.oscillator_strength(ref=1))) + 1
+        expected = 'red shift (negative)'
 
-    overlaps = np.array([abs(np.vdot(vacuum.xy[target][0], x)) for x, _ in calculation.td.xy])
-    matched = int(overlaps.argmax())
-    if overlaps[matched] < 0.7:
-        raise RuntimeError('溶液态混合较强，请检查更多根的振幅和电荷分布后进行态指认。')
+    water = pcm.PCM(mol)
+    water.eps = 78.3553
+    sol = StateSpecificPCM(td, water, eps_optical=1.333**2)
+    sol.kernel(state=1)
+    ptss_gaps = sol.vertical()
+
+    # Match the same electronic state, allowing its energy ordering to change.
+    overlaps = [abs(np.vdot(td.xy[target][0], x)) for x, _ in sol.td.xy]
+    matched = int(np.argmax(overlaps))
     vacuum_ev = vacuum_gaps[target] * HARTREE2EV
-    solution_ev = solution_gaps[matched] * HARTREE2EV
-    shift = solution_ev - vacuum_ev
-    print(f'选定真空 root {target+1} → 溶液 root {matched+1}，重叠={overlaps[matched]:.6f}')
-    print(f'真空 {vacuum_ev:.5f} eV，水模型 ptSS {solution_ev:.5f} eV')
-    print(f'位移 {shift:+.5f} eV（正值为蓝移，负值为红移）')
-    print(f'自洽 {calculation.cycles} 轮，总耗时 {perf_counter()-started:.1f} s', flush=True)
+    ptss_ev = ptss_gaps[matched] * HARTREE2EV
+    ptss_x = sol.td.xy[matched][0]
+
+    # Relax the same optical target's amplitudes and fast polarization.
+    ss_ev = sol.state_specific(state=matched+1, follow_state=True) * HARTREE2EV
+    ss_overlap = abs(np.vdot(ptss_x, sol.ss_td.xy[sol.ss_state-1][0]))
+    print(f'\n{molecule}: expected {expected}')
+    print(f'Vacuum root {target+1} -> water root {matched+1}; overlap = {overlaps[matched]:.4f}')
+    print(f'SS root {sol.ss_state}; overlap with the ptSS state = {ss_overlap:.4f}')
+    print(f'Vacuum gap = {vacuum_ev:.5f} eV')
+    print(f'Water ptSS gap = {ptss_ev:.5f} eV; shift = {ptss_ev-vacuum_ev:+.5f} eV')
+    print(f'Water SS gap   = {ss_ev:.5f} eV; shift = {ss_ev-vacuum_ev:+.5f} eV')

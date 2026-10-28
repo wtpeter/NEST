@@ -18,7 +18,7 @@ The variational model is G[x] = E_ref + x.T A_vacuum x + E_PCM[D[x]].
 Only the physical state's amplitudes and the reaction field are iterated.
 Vertical ptSS energies use the quadratic fast-polarization correction
     1/2 (D_k - D_A) : B(eps_optical) : (D_k - D_A)
-about the equilibrated physical state A. See examples/solvent/README.md.
+about the equilibrated physical state A.
 """
 
 import numpy as np
@@ -89,29 +89,24 @@ def state_density(td, state=1):
     occupation. It is not an orbital-relaxed energy-derivative density.
     """
     _validate_td(td)
+    assert 1 <= state <= len(td.xy)
     x, y = td.xy[state - 1]
     if np.any(y):
         raise ValueError('A normalized TDA amplitude with Y=0 is required.')
-    return _transition_density(td, state - 1, state - 1)
-
-
-def _transition_density(td, bra, ket):
-    """Full spin-summed AO matrix <bra|E|ket>, including the overlap term."""
     mf = td._scf
-    x, y = td.xy[bra][0], td.xy[ket][0]
-    overlap = np.vdot(x, y)
+    norm = np.vdot(x, x)
     if isinstance(td, NTTDA):
         # transition_dm contains the normal-ordered E_pq matrix elements.
-        gamma = transition_dm(td, bra, ket) + overlap * np.diag(mf.mo_occ)
+        gamma = transition_dm(td, state - 1, state - 1) + norm * np.diag(mf.mo_occ)
         # gamma[p,q] = <a_p^+ a_q>; the AO density uses its transpose.
         return mf.mo_coeff @ gamma.T @ mf.mo_coeff.conj().T
 
     spin_o, spin_v = (1, 0) if td.extype == 0 else (0, 1)
     co = mf.mo_coeff[spin_o][:, mf.mo_occ[spin_o] > 0]
     cv = mf.mo_coeff[spin_v][:, mf.mo_occ[spin_v] == 0]
-    hole = x.conj() @ y.T
-    particle = y.T @ x.conj()
-    dm = overlap * np.asarray(mf.make_rdm1()).sum(axis=0)
+    hole = x.conj() @ x.T
+    particle = x.T @ x.conj()
+    dm = norm * np.asarray(mf.make_rdm1()).sum(axis=0)
     return dm - co @ hole @ co.conj().T + cv @ particle @ cv.conj().T
 
 
@@ -222,13 +217,15 @@ class StateSpecificPCM(lib.StreamObject):
 
     Args:
         td: Vacuum SF-TDA or NT-TDA template, with the desired number of roots.
-            Its SCF reference must be converged. The TDA kernel is run here;
-            precomputed TDA amplitudes are optional and are recomputed.
+            Its SCF reference must be converged. The driver solves the vacuum
+            TDA eigenproblem internally, using compatible supplied amplitudes
+            as initial guesses.
         solvent: A PySCF C-PCM object on the same molecule. It is copied.
         eps_optical: Optical dielectric constant (squared refractive index).
 
     ``base`` stores a copy of the input template, sharing its SCF reference.
-    ``gas_td`` stores the initial vacuum spectrum (historical field name).
+    ``gas_td`` stores the initial vacuum spectrum obtained by ``_solve`` with
+    zero reaction field, including ``e``, ``xy`` and ``converged``.
     ``td`` stores the most recent fixed-field result; ``ss_td`` stores the
     final target-field result from non-equilibrium SS. Their eigenvalues
     are fixed-field quantities; use this driver's returned energies/gaps.
@@ -242,13 +239,12 @@ class StateSpecificPCM(lib.StreamObject):
     fixed slow-polarization environment and returns its SS gap. Set
     ``diis_space=6`` to accelerate either outer loop; the default 0 uses
     direct iteration. DIIS uses the fixed-point residual D_out - D_in.
+    ``conv_tol`` inherits the PCM energy tolerance (default 1e-7 Hartree).
+    ``conv_tol_dm`` is the density-change norm threshold (default 1e-4).
 
     Both SS loops select the energy-ordered ``state`` at every iteration.
     Set ``follow_state=True`` on either call to track a root by amplitude
     overlap instead, for example when following a CT state through crossings.
-    ``vertical(method='ptlr')`` is an experimental isolated-root response
-    approximation within the fixed-orbital model.
-
     Each geometry requires a new driver and converged vacuum reference.
     Gradients, TDDFT X/Y amplitudes and orbital relaxation are not implemented.
     """
@@ -272,8 +268,8 @@ class StateSpecificPCM(lib.StreamObject):
         self.with_solvent = solvent.copy().reset()
         self.eps_optical = float(eps_optical)
         self.max_cycle = 30
-        self.conv_tol = 1e-8
-        self.conv_tol_dm = 1e-6
+        self.conv_tol = solvent.conv_tol
+        self.conv_tol_dm = 1e-4
         self.diis_space = 0
         self.converged = False
         self.cycles = 0
@@ -285,9 +281,6 @@ class StateSpecificPCM(lib.StreamObject):
         self.e_frozen = None
         self.e_ptss = None
         self.ptss_correction = None
-        self.ptlr_correction = None
-        self.e_ptlr = None
-        self._equilibrium_xy = None
         self.state = None
         self.history = []
         self.ss_converged = False
@@ -334,7 +327,7 @@ class StateSpecificPCM(lib.StreamObject):
         indices = np.argsort(diagonal)[:min(nroots + 3, len(diagonal))]
         guesses = np.zeros((len(indices), len(diagonal)))
         guesses[np.arange(len(indices)), indices] = 1
-        if x0 is not None:
+        if x0 is not None and x0.shape[1] == len(diagonal):
             # Keep diagonal guesses as well: a previously converged root can
             # miss a newly lower state in another invariant subspace.
             guesses = np.vstack((x0, guesses))
@@ -344,10 +337,12 @@ class StateSpecificPCM(lib.StreamObject):
         def all_eigs(w, v, nroots, envs):
             return w, v, np.arange(w.size)
 
-        tolerance = min(vacuum_td.conv_tol, self.conv_tol_dm * 0.01)
+        # Use the TDA tolerance, tightening it if the outer density threshold
+        # requires a more accurate eigenvector.
+        tolerance = min(vacuum_td.conv_tol, self.conv_tol_dm * 0.1)
         converged, energies, vectors = eigh(
             vind, guesses, precond, nroots=nroots, pick=all_eigs,
-            tol_residual=tolerance, lindep=min(vacuum_td.lindep, tolerance**2 * 0.01),
+            tol_residual=tolerance, lindep=vacuum_td.lindep,
             max_cycle=vacuum_td.max_cycle, max_memory=vacuum_td.max_memory,
             verbose=logger.new_logger(vacuum_td))
         field_td = lib.set_class(vacuum_td.copy(), (_FrozenFieldTDA, vacuum_td.__class__))
@@ -389,14 +384,16 @@ class StateSpecificPCM(lib.StreamObject):
             raise ValueError('state must be between 1 and base.nstates.')
         self.converged = False
         self.history = []
-        self.e_frozen = self.e_ptss = self.e_ptlr = None
-        self.ptss_correction = self.ptlr_correction = None
-        self._equilibrium_xy = None
+        self.e_frozen = self.e_ptss = None
+        self.ptss_correction = None
         self.ss_converged = False
         self.e_ss = self.ss_dm = self.ss_td = self.ss_state = None
         self.ss_cycles = 0
         self.ss_history = []
-        field_td = self._solve(self.base, self._vacuum_response, np.zeros_like(self._dm_ref))
+        x0 = None
+        if self.base.xy:
+            x0 = np.array([np.asarray(x).ravel() for x, _ in self.base.xy])
+        field_td = self._solve(self.base, self._vacuum_response, np.zeros_like(self._dm_ref), x0=x0)
         self.gas_td = field_td
         if state > len(field_td.xy):
             raise ValueError('The requested vacuum root is outside the computed spectrum.')
@@ -428,7 +425,6 @@ class StateSpecificPCM(lib.StreamObject):
             self.dm, self.v, self.e_tot, self.td = dm_new, v_new, energy, field_td
             if abs(de) < self.conv_tol and dm_error < self.conv_tol_dm:
                 self.converged = True
-                self._equilibrium_xy = (field_td.xy[root][0].copy(), 0)
                 break
             e_last = energy
             dm = dm_new if extrapolator is None else extrapolator.update(dm_new, xerr=dm_new-dm)
@@ -452,7 +448,7 @@ class StateSpecificPCM(lib.StreamObject):
         ``ss_td`` contains the final target-field spectrum; its other roots
         share the target's field and are available for state analysis only.
         Initialization refreshes ``vertical(method='frozen')`` results;
-        save previously computed ptSS/ptLR gaps before calling this method.
+        save previously computed ptSS gaps before calling this method.
         """
         self.ss_converged = False
         self.e_ss = self.ss_dm = self.ss_td = self.ss_state = None
@@ -509,17 +505,13 @@ class StateSpecificPCM(lib.StreamObject):
         ``td`` defaults to the original spin sector. A supplied sector must
         share the original mean-field object, orbitals and energy reference.
         This method preserves the equilibrated density and reaction field.
-        ``method`` selects ``'ptss'`` (difference-density correction),
-        ``'ptlr'`` (experimental first-order pole shift from physical-root
-        transition densities), or ``'frozen'`` (common-field baseline).
-        ptLR assumes isolated roots and has model-internal Hessian checks;
-        independent physical benchmarks and coupled near-degenerate response
-        remain to be established. ptSS is the default energy approximation.
+        ``method`` selects ``'ptss'`` (the default difference-density correction)
+        or ``'frozen'`` (common-field baseline).
         """
         if not self.converged:
             raise RuntimeError('Run kernel(state=...) to equilibrate a physical state first.')
-        if method not in ('ptss', 'ptlr', 'frozen'):
-            raise ValueError("method must be 'ptss', 'ptlr', or 'frozen'.")
+        if method not in ('ptss', 'frozen'):
+            raise ValueError("method must be 'ptss' or 'frozen'.")
         vacuum_td = self.base if td is None else td
         if td is None:
             vacuum_response = self._vacuum_response
@@ -541,40 +533,15 @@ class StateSpecificPCM(lib.StreamObject):
         e_pcm, _ = self.with_solvent.kernel(self.dm)
         offset = self.base._scf.e_tot + e_pcm - np.einsum('ij,ji->', self.v, self.dm - self._dm_ref)
         self.e_frozen = self.td.e + offset
-        self.e_ptss = self.e_ptlr = self.ptss_correction = self.ptlr_correction = None
+        self.e_ptss = self.ptss_correction = None
         if method == 'frozen':
             return self.e_frozen - self.e_tot
         # Reset the copied cavity before changing eps so cached PCM matrices
         # always correspond to the requested optical dielectric constant.
         fast = self.with_solvent.copy().reset()
         fast.eps = self.eps_optical
-        if method == 'ptss':
-            delta = np.array([state_density(self.td, k + 1).real - self.dm for k in range(len(self.td.e))])
-            v_delta = fast._B_dot_x(delta)
-            self.ptss_correction = 0.5 * np.einsum('kij,kji->k', delta, v_delta)
-            self.e_ptss = self.e_frozen + self.ptss_correction
-            return self.e_ptss - self.e_tot
-
-        # Linearize the physical-state model about A. For an isolated root k,
-        # its first-order LR pole shift is <D_Ak, B_fast D_kA>. This is a
-        # perturbative root-to-root LR model; near-degenerate poles require
-        # the coupled response problem, which is outside this driver.
-        self.ptlr_correction = np.zeros(len(self.td.e))
-        same_sector = ((isinstance(self.base, NTTDA) and isinstance(vacuum_td, NTTDA)
-                        and self.base.deltaS == vacuum_td.deltaS)
-                       or (isinstance(self.base, TDA_SF) and isinstance(vacuum_td, TDA_SF)
-                           and self.base.extype == vacuum_td.extype))
-        if same_sector:
-            density_td = self.td.copy()
-            density_td.xy = list(self.td.xy) + [self._equilibrium_xy]
-            densities = []
-            for k, (x, _) in enumerate(self.td.xy):
-                if abs(np.vdot(x, self._equilibrium_xy[0])) > 1 - 1e-6:
-                    densities.append(np.zeros_like(self.dm))
-                else:
-                    densities.append(_transition_density(density_td, len(self.td.xy), k).real)
-            densities = np.asarray(densities)
-            response = fast._B_dot_x(densities)
-            self.ptlr_correction = np.einsum('kij,kji->k', densities, response)
-        self.e_ptlr = self.e_frozen + self.ptlr_correction
-        return self.e_ptlr - self.e_tot
+        delta = np.array([state_density(self.td, k + 1).real - self.dm for k in range(len(self.td.e))])
+        v_delta = fast._B_dot_x(delta)
+        self.ptss_correction = 0.5 * np.einsum('kij,kji->k', delta, v_delta)
+        self.e_ptss = self.e_frozen + self.ptss_correction
+        return self.e_ptss - self.e_tot
