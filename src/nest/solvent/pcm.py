@@ -220,7 +220,8 @@ class StateSpecificPCM(lib.StreamObject):
             Its SCF reference must be converged. The driver solves the vacuum
             TDA eigenproblem internally, using compatible supplied amplitudes
             as initial guesses.
-        solvent: A PySCF C-PCM object on the same molecule. It is copied.
+        solvent: A PySCF PCM object on the same molecule. It is copied.
+            C-PCM, COSMO, IEF-PCM and SS(V)PE use the supplied ``method``.
         eps_optical: Optical dielectric constant (squared refractive index).
 
     ``base`` stores a copy of the input template, sharing its SCF reference.
@@ -253,8 +254,8 @@ class StateSpecificPCM(lib.StreamObject):
         _validate_td(td)
         if isinstance(td, _FrozenFieldTDA):
             raise ValueError('Supply a vacuum TDA object, not a frozen-field result.')
-        if type(solvent) is not pcm.PCM or solvent.method.upper() not in ('C-PCM', 'CPCM'):
-            raise TypeError('The initial implementation requires a PySCF C-PCM object.')
+        if type(solvent) is not pcm.PCM:
+            raise TypeError('Supply a PySCF PCM object.')
         if solvent.mol is not td.mol:
             raise ValueError('PCM and TDA must use the same molecule object.')
         if solvent.frozen:

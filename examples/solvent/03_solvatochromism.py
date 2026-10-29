@@ -15,11 +15,26 @@
 
 """Compare NT-TDA vacuum, water ptSS and water SS gaps at fixed geometries.
 
-Expected trends: acetone's lowest singlet n -> pi* excitation shifts to higher
-energy (blue) [JPCA, 2009, 113, 10678];
-p-nitroaniline's bright singlet pi -> pi* excitation shifts to lower energy (red)
-[JPCA, 2011, 115, 9801].
-Both solvent calculations keep the slow polarization equilibrated with S0.
+Water-minus-vacuum shifts: positive means blue, negative means red.
+Experimental reference values:
+  acetone n -> pi*: +1785 cm^-1 = +0.22131 eV (band-envelope center, 293 K).
+    Renge, J. Phys. Chem. A 2009, 113, 10678-10686.
+    https://doi.org/10.1021/jp9033886
+  p-nitroaniline bright pi -> pi*: -0.98 eV (4.24 eV vapor -> 3.26 eV water),
+    quoted in Table 2 of Sok et al., J. Phys. Chem. A 2011, 115, 9801-9809.
+    https://doi.org/10.1021/jp2045564
+These experimental band shifts include solvent structure and nuclear motion.
+Here each molecule has one fixed geometry and the solvent is a continuum.
+Both ptSS and SS keep the slow polarization equilibrated with S0.
+
+Computed shifts with the settings below (eV):
+                   acetone             p-nitroaniline
+PCM method       ptSS        SS         ptSS        SS
+C-PCM         +0.26634   +0.26422     -0.63118   -0.64476
+COSMO         +0.27324   +0.27197     -0.57393   -0.58305
+IEF-PCM       +0.27529   +0.27396     -0.59951   -0.61049
+SS(V)PE       +0.26889   +0.26759     -0.58530   -0.59633
+The script runs C-PCM by default; set water.method to select another row.
 """
 
 import numpy as np
@@ -43,6 +58,7 @@ for molecule in ('acetone', 'p-nitroaniline'):
         expected = 'red shift (negative)'
 
     water = pcm.PCM(mol)
+    # water.method = 'IEF-PCM'  # Also accepts 'COSMO' and 'SS(V)PE'; default is 'C-PCM'.
     water.eps = 78.3553
     sol = StateSpecificPCM(td, water, eps_optical=1.333**2)
     sol.kernel(state=1)

@@ -34,8 +34,9 @@ class PCMTests(unittest.TestCase):
         cls.nt = mf.NTTDA().set(deltaS=-1, nstates=3, conv_tol=1e-10)
         cls.sf = uks.TDA_SF().set(extype=1, nstates=3, conv_tol=1e-10)
 
-    def driver(self, td, eps=10, eps_optical=2):
+    def driver(self, td, eps=10, eps_optical=2, method='C-PCM'):
         solvent = pcm.PCM(self.mol)
+        solvent.method = method
         solvent.eps = eps
         solvent.lebedev_order = 7
         return StateSpecificPCM(td, solvent, eps_optical=eps_optical)
@@ -61,18 +62,30 @@ class PCMTests(unittest.TestCase):
         # Each gap table contains frozen and ptSS rows, in Hartree.
         # The fixed cavity and grid settings define this numerical reference.
         references = (
-            (self.nt, -75.958959924281,
+            (self.nt, 'C-PCM', -75.958959924281,
              [[0.0, 0.273871834613, 0.361661508418],
               [0.0, 0.266210798218, 0.351772869828]],
              0.266116456885),
-            (self.sf, -75.850037724627,
+            (self.nt, 'COSMO', -75.958401313565,
+             [[0.0, 0.272674511768, 0.360414282909],
+              [0.0, 0.266557682435, 0.352517852544]],
+             0.266497637690),
+            (self.nt, 'IEF-PCM', -75.958426568704,
+             [[0.0, 0.272701196104, 0.360448435415],
+              [0.0, 0.266535381888, 0.352503150738]],
+             0.266474061636),
+            (self.nt, 'SS(V)PE', -75.958440052315,
+             [[0.0, 0.272725264790, 0.360495000101],
+              [0.0, 0.266557407966, 0.352543593367]],
+             0.266496123880),
+            (self.sf, 'C-PCM', -75.850037724627,
              [[0.0, 0.356376019168, 0.376024591218],
               [0.0, 0.347207108791, 0.366794552631]],
              0.347117730352),
         )
-        for td, expected_energy, expected_gaps, expected_ss in references:
-            with self.subTest(method=type(td).__name__):
-                sol = self.driver(td)
+        for td, pcm_method, expected_energy, expected_gaps, expected_ss in references:
+            with self.subTest(td=type(td).__name__, pcm=pcm_method):
+                sol = self.driver(td, method=pcm_method)
                 energy = sol.kernel(state=1)
                 self.assertTrue(sol.converged)
                 np.testing.assert_allclose(energy, expected_energy, atol=2e-8, rtol=0)
