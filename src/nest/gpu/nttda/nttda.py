@@ -429,6 +429,7 @@ def gen_rohf_response_sfd(mf, mo_coeff=None, mo_occ=None, hermi=0, max_memory=No
 
 
 def _orbital_indices(tdobj):
+    tdobj.check_sanity()
     occ = tdobj._scf.mo_occ
     return cp.flatnonzero(occ == 2), cp.flatnonzero(occ == 1), cp.flatnonzero(occ == 0)
 
@@ -849,6 +850,7 @@ class NTTDA(TDBase):
 
     Amplitude blocks and spin-channel conventions match nest.nttda.NTTDA.
     Conventional and density-fitted references use the same response operator.
+    Frozen orbitals are not supported; leave frozen=None.
     """
 
     deltaS = CPU_NTTDA.deltaS
@@ -863,8 +865,13 @@ class NTTDA(TDBase):
         super().__init__(mf)
 
     dump_flags = CPU_NTTDA.dump_flags
-    check_sanity = CPU_NTTDA.check_sanity
     get_precond = TDA.get_precond
+
+    def check_sanity(self):
+        CPU_NTTDA.check_sanity(self)
+        if self.frozen is not None:
+            raise NotImplementedError('GPU NTTDA requires frozen=None')
+        return self
 
     def init_guess(self, hdiag, nstates=None):
         if nstates is None:
@@ -902,8 +909,6 @@ class NTTDA(TDBase):
             ncs, nos = len(csidx), len(osidx)
             nocc = ncs + nos
             nvir = nos + len(vsidx)
-            nstates = min(nstates, hdiag.size - 1)
-            self.nstates = nstates
             open_diag = cp.arange(nos)
 
             def project(zs):
@@ -926,6 +931,11 @@ class NTTDA(TDBase):
             csidx, _, vsidx = _orbital_indices(self)
             ncs = len(csidx)
             nvs = len(vsidx)
+
+        nstates = min(nstates, hdiag.size - (self.deltaS == -1))
+        if nstates < 1:
+            raise ValueError('No active NTTDA excitations remain for the requested spin channel')
+        self.nstates = nstates
 
         x0sym = None
         if x0 is None:
@@ -980,6 +990,7 @@ class NTTDA(TDBase):
 
     def get_ab(self, mf=None):
         """Return the independently constructed A matrix as a NumPy array."""
+        self.check_sanity()
         from nest.gpu.nttda.get_ab import get_ab
         if mf is None:
             mf = self._scf
@@ -1000,11 +1011,14 @@ class NTTDA(TDBase):
     def analyze(self, verbose=None):
         return self.to_cpu().analyze(verbose)
 
-    def transition_dipole(self, ref=1, state=None):
-        return self.to_cpu().transition_dipole(ref, state)
+    def transition_dipole(self, ref=1, state=None, picture_change=True):
+        return self.to_cpu().transition_dipole(ref, state, picture_change)
 
-    def oscillator_strength(self, ref=1, state=None):
-        return self.to_cpu().oscillator_strength(ref, state)
+    def transition_velocity_dipole(self, ref=1, state=None, picture_change=True):
+        return self.to_cpu().transition_velocity_dipole(ref, state, picture_change)
+
+    def oscillator_strength(self, ref=1, state=None, gauge='length', picture_change=True):
+        return self.to_cpu().oscillator_strength(ref, state, gauge, picture_change)
 
 
 dft.roks.ROKS.NTTDA = lib.class_as_method(NTTDA)

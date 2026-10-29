@@ -212,6 +212,7 @@ class Gradients(tdrhf_grad.Gradients):
 
     def kernel(self, state=None, atmlst=None):
         """Return d(E_ROKS + omega_state)/dR in Eh/Bohr as a NumPy array."""
+        self.base.check_sanity()
         if state is not None:
             self.state = state
         if atmlst is not None:
