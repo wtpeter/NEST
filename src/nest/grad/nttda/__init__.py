@@ -15,6 +15,7 @@
 """Analytic nuclear gradients for :mod:`nest.nttda`."""
 
 import numpy as np
+from scipy import linalg
 
 from pyscf import dft, gto, lib
 from pyscf.grad import rhf as rhf_grad
@@ -41,7 +42,9 @@ def _aligned_amplitudes(reference, displaced):
         new_mo = displaced._scf.mo_coeff[:, new_idx]
         # The polar factor aligns each occupation space, including signs,
         # permutations and rotations, without mixing distinct CSF sectors.
-        u, _, vh = np.linalg.svd(ref_mo.conj().T @ overlap @ new_mo, full_matrices=False)
+        # NumPy's gesdd can fail on nearly orthogonal blocks; use QR-based SVD.
+        u, _, vh = linalg.svd(ref_mo.conj().T @ overlap @ new_mo,
+                            full_matrices=False, lapack_driver='gesvd')
         rotations.append(u @ vh)
     c, o, v = rotations
     nc, no, nv = (rotation.shape[1] for rotation in rotations)
